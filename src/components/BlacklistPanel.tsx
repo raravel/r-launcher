@@ -39,14 +39,14 @@ export const BlacklistPanel = ({
             블랙리스트
           </h3>
           <p className="text-xs text-muted-foreground">
-            자동 차단 대상 ({entries.length}/10)
+            자동 차단 대상 ({entries.length}명)
           </p>
         </div>
       </div>
 
       {/* Add new entry */}
       <div className="p-4 border-b border-border/50">
-        <AddBlacklistForm onAdd={onAddEntry} disabled={entries.length >= 10} />
+        <AddBlacklistForm onAdd={onAddEntry} />
       </div>
 
       {/* List */}
@@ -113,10 +113,9 @@ export const BlacklistPanel = ({
 // Sub-component for adding new entries
 interface AddBlacklistFormProps {
   onAdd: (battletag: string, memo: string) => void;
-  disabled: boolean;
 }
 
-const AddBlacklistForm = ({ onAdd, disabled }: AddBlacklistFormProps) => {
+const AddBlacklistForm = ({ onAdd }: AddBlacklistFormProps) => {
   const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const form = e.currentTarget;
@@ -136,12 +135,10 @@ const AddBlacklistForm = ({ onAdd, disabled }: AddBlacklistFormProps) => {
         <Input
           name="battletag"
           placeholder="배틀태그#1234"
-          disabled={disabled}
           className="h-8 text-sm bg-secondary/50 border-border/50 focus:border-primary"
         />
         <Button
           type="submit"
-          disabled={disabled}
           size="sm"
           className="h-8 shrink-0"
         >
@@ -151,7 +148,6 @@ const AddBlacklistForm = ({ onAdd, disabled }: AddBlacklistFormProps) => {
       <Input
         name="memo"
         placeholder="메모 (선택사항)"
-        disabled={disabled}
         className="h-7 text-xs bg-secondary/50 border-border/50 focus:border-primary"
       />
     </form>
