@@ -5,10 +5,28 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::State;
 
+// Logging utility for debugging
+fn log_to_file(message: &str) {
+    // Ensure C:\temp directory exists
+    let _ = std::fs::create_dir_all("C:\\temp");
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("C:\\temp\\r-launcher-debug.log")
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let _ = writeln!(file, "[{}] {}", timestamp, message);
+    }
+}
+
 #[cfg(windows)]
 use windows::{
-    core::PCSTR,
-    Win32::Foundation::{CloseHandle, HANDLE},
+    core::{PCSTR, PCWSTR},
+    Win32::Foundation::{CloseHandle, HANDLE, GetLastError},
     Win32::System::Memory::{
         CreateFileMappingA, MapViewOfFile, OpenFileMappingA,
         FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
@@ -34,6 +52,8 @@ pub const MAX_NICKNAME_LEN: usize = 32;
 pub const MAX_ROOM_NAME_LEN: usize = 64;
 pub const MAX_MAP_NAME_LEN: usize = 128;
 pub const MAX_HOST_NAME_LEN: usize = 64;
+pub const MAX_FORCE_NAME_LEN: usize = 64;
+pub const MAX_FORCES: usize = 4;
 pub const SHARED_MEMORY_NAME: &str = "Local\\SCMonitorAutoBan";
 pub const ROOMUSERS_MEMORY_NAME: &str = "Local\\SCMonitorRoomUsers";
 pub const ROOMINFO_MEMORY_NAME: &str = "Local\\SCMonitorRoomInfo";
@@ -106,10 +126,11 @@ pub struct RoomInfoData {
     pub version: u32,
     pub in_room: u32,
     pub last_update: u32,
-    pub reserved: u32,
+    pub force_count: u32,
     pub room_name: [u8; MAX_ROOM_NAME_LEN],
     pub map_name: [u8; MAX_MAP_NAME_LEN],
     pub host_name: [u8; MAX_HOST_NAME_LEN],
+    pub force_names: [[u8; MAX_FORCE_NAME_LEN]; MAX_FORCES],
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -122,6 +143,8 @@ pub struct RoomInfo {
     pub map_name: String,
     #[serde(rename = "hostName")]
     pub host_name: String,
+    #[serde(rename = "forceNames")]
+    pub force_names: Vec<String>,
 }
 
 // Latency shared memory structures (must match DLL exactly)
@@ -543,6 +566,7 @@ fn get_room_info() -> RoomInfo {
                         room_name: String::new(),
                         map_name: String::new(),
                         host_name: String::new(),
+                        force_names: Vec::new(),
                     };
                 }
             };
@@ -555,6 +579,7 @@ fn get_room_info() -> RoomInfo {
                     room_name: String::new(),
                     map_name: String::new(),
                     host_name: String::new(),
+                    force_names: Vec::new(),
                 };
             }
 
@@ -582,6 +607,19 @@ fn get_room_info() -> RoomInfo {
                 .unwrap_or(MAX_HOST_NAME_LEN);
             let host_name = String::from_utf8_lossy(&data.host_name[..host_name_end]).to_string();
 
+            // Extract force names
+            let mut force_names = Vec::new();
+            for i in 0..data.force_count.min(MAX_FORCES as u32) as usize {
+                let force_name_end = data.force_names[i]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(MAX_FORCE_NAME_LEN);
+                let force_name = String::from_utf8_lossy(&data.force_names[i][..force_name_end]).to_string();
+                if !force_name.is_empty() {
+                    force_names.push(force_name);
+                }
+            }
+
             let _ = CloseHandle(h);
 
             RoomInfo {
@@ -589,6 +627,7 @@ fn get_room_info() -> RoomInfo {
                 room_name,
                 map_name,
                 host_name,
+                force_names,
             }
         }
     }
@@ -599,6 +638,7 @@ fn get_room_info() -> RoomInfo {
             room_name: String::new(),
             map_name: String::new(),
             host_name: String::new(),
+            force_names: Vec::new(),
         }
     }
 }
@@ -703,11 +743,16 @@ async fn is_dll_injected() -> bool {
             // Find StarCraft process
             let pid = match find_process_by_name("StarCraft.exe") {
                 Some(pid) => pid,
-                None => return false,
+                None => {
+                    log_to_file("[IS_DLL_INJECTED] StarCraft.exe not found");
+                    return false;
+                }
             };
 
             // Check if sc_hook_dll.dll is loaded in the process
-            return is_module_loaded_in_process(pid, "sc_hook_dll.dll");
+            let result = is_module_loaded_in_process(pid, "sc_hook_dll.dll");
+            log_to_file(&format!("[IS_DLL_INJECTED] PID: {}, Result: {}", pid, result));
+            return result;
         }
 
         #[cfg(not(windows))]
@@ -724,6 +769,8 @@ fn is_module_loaded_in_process(pid: u32, module_name: &str) -> bool {
         MODULEENTRY32, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
     };
 
+    log_to_file(&format!("[IS_MODULE_LOADED] Checking for module '{}' in PID {}", module_name, pid));
+
     unsafe {
         // Create snapshot of modules
         let snapshot = match CreateToolhelp32Snapshot(
@@ -731,7 +778,10 @@ fn is_module_loaded_in_process(pid: u32, module_name: &str) -> bool {
             pid,
         ) {
             Ok(h) => h,
-            Err(_) => return false,
+            Err(e) => {
+                log_to_file(&format!("[IS_MODULE_LOADED] Failed to create snapshot: {:?}", e));
+                return false;
+            }
         };
 
         let mut entry = MODULEENTRY32 {
@@ -739,13 +789,27 @@ fn is_module_loaded_in_process(pid: u32, module_name: &str) -> bool {
             ..Default::default()
         };
 
+        let mut module_count = 0;
+
         if Module32First(snapshot, &mut entry).is_ok() {
             loop {
                 let name = std::ffi::CStr::from_ptr(entry.szModule.as_ptr())
                     .to_string_lossy()
                     .to_lowercase();
 
-                if name.contains(&module_name.to_lowercase()) {
+                module_count += 1;
+
+                // Log only DLL modules
+                if name.ends_with(".dll") {
+                    log_to_file(&format!("[IS_MODULE_LOADED] Found: {}", name));
+                }
+
+                // Check for multiple possible DLL name variations
+                let target_lower = module_name.to_lowercase();
+                if name.contains(&target_lower) ||
+                   name.contains("sc_hook") ||
+                   name.contains("sc-hook") {
+                    log_to_file(&format!("[IS_MODULE_LOADED] ✓ MATCH! '{}' found", name));
                     let _ = CloseHandle(snapshot);
                     return true;
                 }
@@ -756,6 +820,7 @@ fn is_module_loaded_in_process(pid: u32, module_name: &str) -> bool {
             }
         }
 
+        log_to_file(&format!("[IS_MODULE_LOADED] ✗ '{}' NOT found (checked {} modules)", module_name, module_count));
         let _ = CloseHandle(snapshot);
         false
     }
@@ -805,41 +870,110 @@ fn find_process_by_name(name: &str) -> Option<u32> {
 
 #[cfg(windows)]
 fn inject_dll_into_process(pid: u32, dll_path: &str) -> Result<(), String> {
-    println!("[INJECT] Starting injection into PID: {}", pid);
-    println!("[INJECT] DLL path: {}", dll_path);
+    let msg = format!("[INJECT] Starting injection into PID: {}", pid);
+    println!("{}", msg);
+    log_to_file(&msg);
+
+    let msg = format!("[INJECT] DLL path: {}", dll_path);
+    println!("{}", msg);
+    log_to_file(&msg);
+
+    // Verify DLL exists before injection
+    if !std::path::Path::new(dll_path).exists() {
+        let msg = format!("[INJECT] ERROR: DLL file does not exist at path: {}", dll_path);
+        println!("{}", msg);
+        log_to_file(&msg);
+        return Err(format!("DLL file not found: {}", dll_path));
+    }
+    log_to_file("[INJECT] DLL file verified to exist");
+
+    // Try loading the DLL locally first to check for dependency issues
+    unsafe {
+        use windows::Win32::System::LibraryLoader::LoadLibraryW;
+        use std::os::windows::ffi::OsStrExt;
+
+        let wide_test_path: Vec<u16> = std::ffi::OsStr::new(dll_path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        log_to_file("[INJECT] Testing DLL load locally first...");
+        println!("[INJECT] Testing DLL load locally first...");
+
+        match LoadLibraryW(PCWSTR(wide_test_path.as_ptr())) {
+            Ok(handle) => {
+                log_to_file("[INJECT] Local test load succeeded");
+                println!("[INJECT] Local test load succeeded");
+                // Free the library handle
+                use windows::Win32::Foundation::FreeLibrary;
+                let _ = FreeLibrary(handle);
+            }
+            Err(e) => {
+                let error_code = GetLastError();
+                let msg = format!("[INJECT] ERROR: Local test load failed! Error: {} (code: {:?})", e, error_code);
+                println!("{}", msg);
+                log_to_file(&msg);
+                log_to_file("[INJECT] Common error codes:");
+                log_to_file("[INJECT]   126 (0x7E) = Module not found (missing dependency)");
+                log_to_file("[INJECT]   193 (0xC1) = Not a valid Win32 application (wrong architecture)");
+                return Err(format!("DLL cannot be loaded locally: {} (Error code: {:?}). Check dependencies and architecture.", e, error_code));
+            }
+        }
+    }
 
     unsafe {
         // Open the target process
+        log_to_file("[INJECT] Opening process with PROCESS_ALL_ACCESS...");
         println!("[INJECT] Opening process with PROCESS_ALL_ACCESS...");
         let process = OpenProcess(PROCESS_ALL_ACCESS, false, pid)
             .map_err(|e| {
-                println!("[INJECT] ERROR: Failed to open process: {}", e);
+                let msg = format!("[INJECT] ERROR: Failed to open process: {}", e);
+                println!("{}", msg);
+                log_to_file(&msg);
                 format!("Failed to open process: {}", e)
             })?;
-        println!("[INJECT] Process opened successfully: {:?}", process);
+        let msg = format!("[INJECT] Process opened successfully: {:?}", process);
+        println!("{}", msg);
+        log_to_file(&msg);
 
-        // Get LoadLibraryA address
+        // Get LoadLibraryW address (using W for Unicode support)
+        log_to_file("[INJECT] Getting kernel32.dll handle...");
         println!("[INJECT] Getting kernel32.dll handle...");
         let kernel32 = GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr()))
             .map_err(|e| {
-                println!("[INJECT] ERROR: Failed to get kernel32: {}", e);
+                let msg = format!("[INJECT] ERROR: Failed to get kernel32: {}", e);
+                println!("{}", msg);
+                log_to_file(&msg);
                 format!("Failed to get kernel32: {}", e)
             })?;
-        println!("[INJECT] kernel32.dll handle: {:?}", kernel32);
+        let msg = format!("[INJECT] kernel32.dll handle: {:?}", kernel32);
+        println!("{}", msg);
+        log_to_file(&msg);
 
-        println!("[INJECT] Getting LoadLibraryA address...");
-        let load_library = GetProcAddress(kernel32, PCSTR(b"LoadLibraryA\0".as_ptr()))
+        log_to_file("[INJECT] Getting LoadLibraryW address...");
+        println!("[INJECT] Getting LoadLibraryW address...");
+        let load_library = GetProcAddress(kernel32, PCSTR(b"LoadLibraryW\0".as_ptr()))
             .ok_or_else(|| {
-                println!("[INJECT] ERROR: Failed to get LoadLibraryA address");
-                "Failed to get LoadLibraryA address".to_string()
+                let msg = "[INJECT] ERROR: Failed to get LoadLibraryW address".to_string();
+                println!("{}", msg);
+                log_to_file(&msg);
+                msg
             })?;
-        println!("[INJECT] LoadLibraryA address: {:?}", load_library);
+        let msg = format!("[INJECT] LoadLibraryW address: {:?}", load_library);
+        println!("{}", msg);
+        log_to_file(&msg);
 
-        // Allocate memory in target process for DLL path
-        let dll_path_bytes = dll_path.as_bytes();
-        let path_len = dll_path_bytes.len() + 1;
-        println!("[INJECT] DLL path length: {} bytes", path_len);
-
+        // Convert DLL path to wide string (UTF-16) for LoadLibraryW
+        use std::os::windows::ffi::OsStrExt;
+        let wide_path: Vec<u16> = std::ffi::OsStr::new(dll_path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let path_len = wide_path.len() * 2; // 2 bytes per UTF-16 character
+        let msg = format!("[INJECT] DLL path length: {} bytes (UTF-16)", path_len);
+        println!("{}", msg);
+        log_to_file(&msg);
+        log_to_file(&format!("[INJECT] Allocating {} bytes in target process...", path_len));
         println!("[INJECT] Allocating {} bytes in target process...", path_len);
         let remote_memory = VirtualAllocEx(
             process,
@@ -850,32 +984,42 @@ fn inject_dll_into_process(pid: u32, dll_path: &str) -> Result<(), String> {
         );
 
         if remote_memory.is_null() {
-            println!("[INJECT] ERROR: VirtualAllocEx returned null");
+            let msg = "[INJECT] ERROR: VirtualAllocEx returned null".to_string();
+            println!("{}", msg);
+            log_to_file(&msg);
             let _ = CloseHandle(process);
             return Err("Failed to allocate memory in target process".to_string());
         }
-        println!("[INJECT] Remote memory allocated at: {:?}", remote_memory);
+        let msg = format!("[INJECT] Remote memory allocated at: {:?}", remote_memory);
+        println!("{}", msg);
+        log_to_file(&msg);
 
-        // Write DLL path to target process
-        println!("[INJECT] Writing DLL path to target process...");
+        // Write DLL path to target process (as UTF-16)
+        log_to_file("[INJECT] Writing DLL path (UTF-16) to target process...");
+        println!("[INJECT] Writing DLL path (UTF-16) to target process...");
         let mut bytes_written = 0;
         let write_result = WriteProcessMemory(
             process,
             remote_memory,
-            dll_path_bytes.as_ptr() as *const _,
+            wide_path.as_ptr() as *const _,
             path_len,
             Some(&mut bytes_written),
         );
 
         if write_result.is_err() {
-            println!("[INJECT] ERROR: WriteProcessMemory failed");
+            let msg = "[INJECT] ERROR: WriteProcessMemory failed".to_string();
+            println!("{}", msg);
+            log_to_file(&msg);
             let _ = VirtualFreeEx(process, remote_memory, 0, MEM_RELEASE);
             let _ = CloseHandle(process);
             return Err("Failed to write DLL path to target process".to_string());
         }
-        println!("[INJECT] Wrote {} bytes to target process", bytes_written);
+        let msg = format!("[INJECT] Wrote {} bytes to target process", bytes_written);
+        println!("{}", msg);
+        log_to_file(&msg);
 
         // Create remote thread to load the DLL
+        log_to_file("[INJECT] Creating remote thread...");
         println!("[INJECT] Creating remote thread...");
         let thread = CreateRemoteThread(
             process,
@@ -889,30 +1033,51 @@ fn inject_dll_into_process(pid: u32, dll_path: &str) -> Result<(), String> {
 
         match thread {
             Ok(handle) => {
-                println!("[INJECT] Remote thread created: {:?}", handle);
+                let msg = format!("[INJECT] Remote thread created: {:?}", handle);
+                println!("{}", msg);
+                log_to_file(&msg);
+
+                log_to_file("[INJECT] Waiting for thread to complete (5s timeout)...");
                 println!("[INJECT] Waiting for thread to complete (5s timeout)...");
                 let wait_result = windows::Win32::System::Threading::WaitForSingleObject(handle, 5000);
-                println!("[INJECT] WaitForSingleObject result: {:?}", wait_result);
+                let msg = format!("[INJECT] WaitForSingleObject result: {:?}", wait_result);
+                println!("{}", msg);
+                log_to_file(&msg);
 
-                // Check the return value of LoadLibraryA
+                // Check the return value of LoadLibraryW
                 let mut exit_code: u32 = 0;
                 if GetExitCodeThread(handle, &mut exit_code).is_ok() {
-                    println!("[INJECT] LoadLibraryA returned: 0x{:08x}", exit_code);
+                    let msg = format!("[INJECT] LoadLibraryW returned: 0x{:08x}", exit_code);
+                    println!("{}", msg);
+                    log_to_file(&msg);
+
                     if exit_code == 0 {
-                        println!("[INJECT] ERROR: LoadLibraryA FAILED! DLL did not load.");
+                        log_to_file("[INJECT] ERROR: LoadLibraryW FAILED! DLL did not load.");
+                        log_to_file("[INJECT] Possible causes:");
+                        log_to_file("[INJECT]   - DLL has missing dependencies");
+                        log_to_file("[INJECT]   - DLL architecture mismatch");
+                        println!("[INJECT] ERROR: LoadLibraryW FAILED! DLL did not load.");
                         println!("[INJECT] Possible causes:");
                         println!("[INJECT]   - DLL has missing dependencies");
                         println!("[INJECT]   - DLL architecture mismatch");
-                        println!("[INJECT]   - DLL path encoding issue");
+
+                        let _ = CloseHandle(handle);
+                        let _ = VirtualFreeEx(process, remote_memory, 0, MEM_RELEASE);
+                        let _ = CloseHandle(process);
+                        return Err(format!("LoadLibraryA failed - DLL exists but could not be loaded. Check dependencies and architecture."));
                     } else {
-                        println!("[INJECT] SUCCESS: DLL loaded at base address 0x{:08x}", exit_code);
+                        let msg = format!("[INJECT] SUCCESS: DLL loaded at base address 0x{:08x}", exit_code);
+                        println!("{}", msg);
+                        log_to_file(&msg);
                     }
                 }
 
                 let _ = CloseHandle(handle);
             }
             Err(e) => {
-                println!("[INJECT] ERROR: CreateRemoteThread failed: {}", e);
+                let msg = format!("[INJECT] ERROR: CreateRemoteThread failed: {}", e);
+                println!("{}", msg);
+                log_to_file(&msg);
                 let _ = VirtualFreeEx(process, remote_memory, 0, MEM_RELEASE);
                 let _ = CloseHandle(process);
                 return Err(format!("Failed to create remote thread: {}", e));
@@ -986,28 +1151,55 @@ fn inject_dll(dll_path: String) -> Result<String, String> {
 #[tauri::command]
 fn get_default_dll_path() -> String {
     println!("[GET_DLL_PATH] Searching for DLL...");
+    log_to_file("[GET_DLL_PATH] Searching for DLL...");
+
+    // Get the directory where the executable is located
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+    if let Some(dir) = &exe_dir {
+        let msg = format!("[GET_DLL_PATH] Executable directory: {:?}", dir);
+        println!("{}", msg);
+        log_to_file(&msg);
+    } else {
+        log_to_file("[GET_DLL_PATH] ERROR: Could not get executable directory");
+    }
 
     // Try to find the DLL in common locations
     // Note: Use ASCII-only paths to avoid LoadLibraryA encoding issues
-    let possible_paths = [
-        // ASCII-only path (preferred)
-        r"C:\temp\sc_hook_dll.dll",
-        // Relative to the app
-        "sc_hook_dll.dll",
-    ];
+    let mut possible_paths: Vec<String> = Vec::new();
 
-    for path in possible_paths {
-        println!("[GET_DLL_PATH] Checking: {}", path);
+    // First, check next to the executable
+    if let Some(dir) = exe_dir {
+        let dll_next_to_exe = dir.join("sc_hook_dll.dll");
+        possible_paths.push(dll_next_to_exe.to_string_lossy().to_string());
+    }
+
+    // Fallback paths
+    possible_paths.push(r"C:\temp\sc_hook_dll.dll".to_string());
+    possible_paths.push("sc_hook_dll.dll".to_string());
+
+    for path in &possible_paths {
+        let msg = format!("[GET_DLL_PATH] Checking: {}", path);
+        println!("{}", msg);
+        log_to_file(&msg);
+
         if std::path::Path::new(path).exists() {
-            println!("[GET_DLL_PATH] FOUND: {}", path);
-            return path.to_string();
+            let msg = format!("[GET_DLL_PATH] FOUND: {}", path);
+            println!("{}", msg);
+            log_to_file(&msg);
+            return path.clone();
         } else {
+            log_to_file("[GET_DLL_PATH] Not found at this path");
             println!("[GET_DLL_PATH] Not found at this path");
         }
     }
 
-    println!("[GET_DLL_PATH] No DLL found, returning default: {}", possible_paths[0]);
-    possible_paths[0].to_string()
+    let msg = format!("[GET_DLL_PATH] No DLL found, returning default: {}", possible_paths[0]);
+    println!("{}", msg);
+    log_to_file(&msg);
+    possible_paths[0].clone()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -147,6 +147,8 @@ static ROOM_USERS: AtomicPtr<RoomUsersData> = AtomicPtr::new(std::ptr::null_mut(
 pub const MAX_ROOM_NAME_LEN: usize = 64;
 pub const MAX_MAP_NAME_LEN: usize = 128;
 pub const MAX_HOST_NAME_LEN: usize = 64;
+pub const MAX_FORCE_NAME_LEN: usize = 64;
+pub const MAX_FORCES: usize = 4;
 pub const ROOMINFO_MEMORY_NAME: &[u8] = b"Local\\SCMonitorRoomInfo\0";
 
 #[repr(C)]
@@ -154,10 +156,11 @@ pub struct RoomInfo {
     pub version: u32,                              // Structure version
     pub in_room: u32,                              // 1 if in a room, 0 if not
     pub last_update: u32,                          // Unix timestamp
-    pub reserved: u32,                             // Padding
+    pub force_count: u32,                          // Number of forces (teams)
     pub room_name: [u8; MAX_ROOM_NAME_LEN],        // Room name
     pub map_name: [u8; MAX_MAP_NAME_LEN],          // Map name (Korean map names can be long)
     pub host_name: [u8; MAX_HOST_NAME_LEN],        // Host/creator name
+    pub force_names: [[u8; MAX_FORCE_NAME_LEN]; MAX_FORCES], // Force/team names
 }
 
 // Global pointer to room info shared memory
@@ -523,41 +526,114 @@ fn update_autoban_stats(battletag: &str) {
     }
 }
 
-// Extract battletag and nickname from 441-byte user info packet
+// Extract battletag and nickname from User Info packet
 // Returns (battletag, nickname)
 fn extract_user_info_from_441_packet(data: &[u8]) -> Option<(String, String)> {
-    // 441-byte packet structure:
-    // - Header: bytes 0-26 (08 01 12 ...)
-    // - Battletag: starts at offset 27, null-terminated
-    // - Nickname: starts around offset 227, null-terminated
+    // User Info packet identification by HEADER structure (not length):
+    // - Header: 08 01 12 (offset 0-2)
+    // - Varint length at offset 3:
+    //   - Full User Info: a6 03 (varint = 422, 2 bytes) -> contains battletag + nickname
+    //   - Packet total length varies (429-441 bytes observed)
+    // - After varint: 00 00 00 00 [4B checksum] ...
+    // - Marker at offset ~20-22: 3a 00 (for full user info)
+    // - Battletag: offset ~26 from start, contains '#' character
+    // - Nickname: offset ~200-230 from start
 
-    if data.len() != 441 {
+    if data.len() < 50 {
         return None;
     }
 
-    // Check header pattern
+    // Check header pattern: 08 01 12
     if data[0] != 0x08 || data[1] != 0x01 || data[2] != 0x12 {
         return None;
     }
 
-    // Extract battletag (starts at offset 27)
-    let battletag_start = 27;
-    let battletag_end = data[battletag_start..].iter()
+    // Check for Full User Info packet by varint value
+    // Varint a6 03 = (0x03 << 7) | (0xa6 & 0x7f) = 384 + 38 = 422
+    // This is the payload length indicator for user info packets
+    if data.len() < 5 {
+        return None;
+    }
+
+    // Check if this is a Full User Info packet (varint = a6 03)
+    let is_full_user_info = data[3] == 0xa6 && data[4] == 0x03;
+
+    if !is_full_user_info {
+        return None;
+    }
+
+    // Full User Info packet structure:
+    // offset 0-2: 08 01 12 (header)
+    // offset 3-4: a6 03 (varint length = 422)
+    // offset 5-8: 00 00 00 00 (padding)
+    // offset 9-12: checksum (4 bytes)
+    // offset 13-20: various fields
+    // offset 21-22: 3a 00 (user info marker)
+    // offset 23-26: flags
+    // offset 27+: battletag (UTF-8, null-terminated, contains #)
+    // offset ~227+: nickname (ASCII, null-terminated)
+
+    let data_start = 5; // After header (3) + varint (2)
+
+    // Verify user info marker at offset 21-22 (data_start + 16-17)
+    let marker_offset = data_start + 16;
+    if data.len() < marker_offset + 2 {
+        return None;
+    }
+    if data[marker_offset] != 0x3a || data[marker_offset + 1] != 0x00 {
+        return None;
+    }
+
+    // Extract battletag - search for '#' character
+    let battletag_search_start = data_start + 22; // offset ~27
+    let battletag_search_end = std::cmp::min(data_start + 115, data.len());
+
+    let mut hash_pos = None;
+    for i in battletag_search_start..battletag_search_end {
+        if data[i] == b'#' {
+            hash_pos = Some(i);
+            break;
+        }
+    }
+
+    let hash_pos = hash_pos?;
+
+    // Find start of battletag (go backwards to find null or padding)
+    let mut battletag_start = battletag_search_start;
+    for i in (battletag_search_start..hash_pos).rev() {
+        if data[i] == 0 {
+            battletag_start = i + 1;
+            break;
+        }
+    }
+
+    // Find end of battletag (null terminator after # and digits)
+    let battletag_end = data[hash_pos..].iter()
         .position(|&b| b == 0)
-        .map(|p| battletag_start + p)
-        .unwrap_or(battletag_start + 80);
+        .map(|p| hash_pos + p)
+        .unwrap_or(std::cmp::min(hash_pos + 10, data.len()));
+
+    if battletag_start >= battletag_end {
+        return None;
+    }
 
     let battletag = std::str::from_utf8(&data[battletag_start..battletag_end])
         .ok()?
         .to_string();
 
-    // Validate battletag (should contain #)
+    // Validate battletag (must contain #)
     if !battletag.contains('#') {
         return None;
     }
 
     // Find nickname in range 200-340 (search for first non-zero ASCII sequence)
-    let nickname = find_nickname_in_range(&data[200..340]).unwrap_or_default();
+    let nickname_start = std::cmp::min(200, data.len());
+    let nickname_end = std::cmp::min(340, data.len());
+    let nickname = if nickname_start < nickname_end {
+        find_nickname_in_range(&data[nickname_start..nickname_end]).unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     Some((battletag, nickname))
 }
@@ -574,14 +650,17 @@ fn find_nickname_in_range(data: &[u8]) -> Option<String> {
     std::str::from_utf8(&data[start..end]).ok().map(|s| s.to_string())
 }
 
-// Extract room info from 184-byte room join packet (WSARECVFROM)
+// Extract room info from room join packet (WSARECVFROM)
 // Returns (room_name, map_name, host_name)
 fn extract_room_info_from_packet(data: &[u8]) -> Option<(String, String, String)> {
-    // 184-byte packet structure:
-    // - Header: 08 01 12 80 01 (offset 0-4)
-    // - Room name: offset 41, null-terminated
-    // - CSV data with host name: after room name null, ends with \r (0x0d)
-    // - Map name: after first \r, until \r\r
+    // Room info packet structure:
+    // - Header: 08 01 12 (offset 0-2)
+    // - Length: varint at offset 3 (1 byte if < 0x80, 2 bytes if >= 0x80)
+    // - After length field: data starts
+    // - Room info identifier: 02 00 03 at offset 9 (after varint) from data start
+    // - Room name: offset 37 from data start, null-terminated
+    //
+    // Force info packet has 00 00 00 instead of 02 00 03
 
     if data.len() < 100 {
         return None;
@@ -592,8 +671,23 @@ fn extract_room_info_from_packet(data: &[u8]) -> Option<(String, String, String)
         return None;
     }
 
-    // Room name starts at offset 41
-    let room_name_start = 41;
+    // Determine varint length (offset 3)
+    // If byte >= 0x80, it's a 2-byte varint, otherwise 1-byte
+    let varint_len = if data[3] >= 0x80 { 2 } else { 1 };
+    let data_start = 3 + varint_len; // Start of actual data after header + varint
+
+    // Check if this is a room info packet (not force info)
+    // Room info has 02 00 03 at offset 8 from data_start
+    let id_offset = data_start + 8;
+    if data.len() < id_offset + 3 {
+        return None;
+    }
+    if data[id_offset] != 0x02 || data[id_offset + 1] != 0x00 || data[id_offset + 2] != 0x03 {
+        return None; // This is force info or other packet, not room info
+    }
+
+    // Room name starts at offset 36 from data_start
+    let room_name_start = data_start + 36;
     if room_name_start >= data.len() {
         return None;
     }
@@ -640,21 +734,39 @@ fn extract_room_info_from_packet(data: &[u8]) -> Option<(String, String, String)
         String::new()
     };
 
-    // Find map name: after first \r, until next \r or \r\r
+    // Find map name: after first \r, until next \r\r or double \r
     let map_name = if let Some(cr_pos) = first_cr {
         let map_start = cr_pos + 1;
         if map_start < data.len() {
-            // Find end of map name (next \r or null)
-            let map_end = data[map_start..].iter()
-                .position(|&b| b == 0x0d || b == 0)
+            // Find end of map name (look for \r\r pattern or null)
+            let map_end = data[map_start..].windows(2)
+                .position(|w| (w[0] == 0x0d && w[1] == 0x0d) || w[0] == 0)
                 .map(|p| map_start + p)
-                .unwrap_or(data.len());
+                .unwrap_or_else(|| {
+                    // Fallback: find single \r or null
+                    data[map_start..].iter()
+                        .position(|&b| b == 0x0d || b == 0)
+                        .map(|p| map_start + p)
+                        .unwrap_or(data.len())
+                });
 
             if map_end > map_start {
-                std::str::from_utf8(&data[map_start..map_end])
-                    .ok()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default()
+                // Filter out StarCraft color codes (0x01-0x1F control characters)
+                // but keep valid UTF-8 sequences
+                let filtered: Vec<u8> = data[map_start..map_end]
+                    .iter()
+                    .copied()
+                    .filter(|&b| b >= 0x20 || b == 0x09) // Keep printable chars and tab
+                    .collect();
+
+                String::from_utf8(filtered)
+                    .unwrap_or_else(|_| {
+                        // If still invalid UTF-8, use lossy conversion
+                        String::from_utf8_lossy(&data[map_start..map_end])
+                            .chars()
+                            .filter(|c| !c.is_control() || *c == '\t')
+                            .collect()
+                    })
             } else {
                 String::new()
             }
@@ -666,6 +778,138 @@ fn extract_room_info_from_packet(data: &[u8]) -> Option<(String, String, String)
     };
 
     Some((room_name, map_name, host_name))
+}
+
+// Extract force (team) info from force packet (WSARECVFROM)
+// Returns vector of force names
+fn extract_force_info_from_packet(data: &[u8]) -> Option<Vec<String>> {
+    // Force info packet structure:
+    // - Header: 08 01 12 (offset 0-2)
+    // - Length: varint at offset 3 (1 byte if < 0x80, 2 bytes if >= 0x80)
+    // - After length field: data starts
+    // - Force info identifier: 00 00 00 at offset 8 from data start
+    // - Force names are null-terminated strings starting with '[' character
+    //
+    // Force packets are typically 100-200 bytes
+    // User Info packets are 400+ bytes and should NOT be detected as force
+    //
+    // Example force names: "[Nature Perfect.ver]", "[By.Bread_183]"
+
+    // Force packets are typically 100-200 bytes, User Info is 400+
+    if data.len() < 100 || data.len() > 250 {
+        return None;
+    }
+
+    // Check header pattern: 08 01 12
+    if data[0] != 0x08 || data[1] != 0x01 || data[2] != 0x12 {
+        return None;
+    }
+
+    // Determine varint length (offset 3)
+    let varint_len = if data[3] >= 0x80 { 2 } else { 1 };
+    let data_start = 3 + varint_len;
+
+    // Check if this is a force info packet (not room info)
+    // Force info has 00 00 00 at offset 8 from data_start
+    let id_offset = data_start + 8;
+    if data.len() < id_offset + 3 {
+        return None;
+    }
+    if data[id_offset] != 0x00 || data[id_offset + 1] != 0x00 || data[id_offset + 2] != 0x00 {
+        return None; // This is room info or other packet, not force info
+    }
+
+    // Additional check: Force packets have 01 00 00 00 at offset 15-18 from data_start
+    // User Info packets have different structure
+    let check_offset = data_start + 15;
+    if data.len() < check_offset + 4 {
+        return None;
+    }
+    if data[check_offset] != 0x01 || data[check_offset + 1] != 0x00 ||
+       data[check_offset + 2] != 0x00 || data[check_offset + 3] != 0x00 {
+        return None;
+    }
+
+    let mut forces = Vec::new();
+    let mut pos = data_start + 17; // Start scanning from appropriate offset
+
+    while pos < data.len() && forces.len() < MAX_FORCES {
+        // Look for null-terminated strings
+        // Skip non-printable bytes until we find a printable character
+        while pos < data.len() && (data[pos] < 0x20 || data[pos] == 0x00) {
+            pos += 1;
+        }
+
+        if pos >= data.len() {
+            break;
+        }
+
+        // Find end of string (null terminator)
+        let start = pos;
+        while pos < data.len() && data[pos] != 0x00 {
+            pos += 1;
+        }
+
+        if pos > start {
+            // Filter out control characters and try to parse as UTF-8
+            let filtered: Vec<u8> = data[start..pos]
+                .iter()
+                .copied()
+                .filter(|&b| b >= 0x20 || b == 0x09)
+                .collect();
+
+            if !filtered.is_empty() {
+                if let Ok(s) = String::from_utf8(filtered.clone()) {
+                    // Only add if it looks like a force name (not garbage)
+                    // Force names typically don't start with common prefixes like "feedda7a"
+                    if !s.starts_with("feedda") && !s.is_empty() && s.len() <= MAX_FORCE_NAME_LEN {
+                        forces.push(s);
+                        log!("FORCE DETECTED: '{}'", forces.last().unwrap());
+                    }
+                }
+            }
+        }
+
+        pos += 1; // Skip null terminator
+    }
+
+    if forces.is_empty() {
+        None
+    } else {
+        Some(forces)
+    }
+}
+
+// Update force info in shared memory
+fn update_force_info(forces: &[String]) {
+    let room_ptr = ROOM_INFO.load(Ordering::SeqCst);
+    if room_ptr.is_null() {
+        return;
+    }
+
+    unsafe {
+        let room = &mut *room_ptr;
+
+        // Clear existing force names
+        for i in 0..MAX_FORCES {
+            room.force_names[i] = [0; MAX_FORCE_NAME_LEN];
+        }
+
+        // Copy new force names
+        room.force_count = forces.len().min(MAX_FORCES) as u32;
+        for (i, force) in forces.iter().take(MAX_FORCES).enumerate() {
+            let bytes = force.as_bytes();
+            let copy_len = bytes.len().min(MAX_FORCE_NAME_LEN - 1);
+            room.force_names[i][..copy_len].copy_from_slice(&bytes[..copy_len]);
+        }
+
+        // Update timestamp
+        if let Ok(duration) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            room.last_update = duration.as_secs() as u32;
+        }
+    }
+
+    log!("FORCE INFO UPDATED: {} forces", forces.len());
 }
 
 // Clear all room users (called when joining a new room)
@@ -1221,7 +1465,8 @@ fn reset_drop_timer() {
         let timer_addr = base_addr.wrapping_add(drop_timer_offset);
 
         // Safety check: ensure address is reasonable
-        if timer_addr < 0x10000 || timer_addr > 0x7FFFFFFFFFFF {
+        // For 32-bit processes, valid user-mode addresses are typically below 0x7FFFFFFF
+        if timer_addr < 0x10000 || timer_addr > 0x7FFFFFFF {
             config.status = 3; // error
             return;
         }
@@ -2046,6 +2291,12 @@ unsafe extern "system" fn hooked_wsarecvfrom(
                         update_room_info(&room_name, &map_name, &host_name);
                     }
 
+                    // Force parsing disabled - packet structure too complex/uncertain
+                    // if let Some(forces) = extract_force_info_from_packet(data) {
+                    //     log!("=== FORCE INFO === {} forces detected", forces.len());
+                    //     update_force_info(&forces);
+                    // }
+
                     // Extract battletag and nickname from 441-byte packet
                     if let Some((battletag, nickname)) = extract_user_info_from_441_packet(data) {
                         log!("USER INFO DETECTED: battletag={} nickname={} from {}:{}",
@@ -2442,9 +2693,13 @@ unsafe extern "system" fn command_thread(_param: *mut c_void) -> u32 {
     (*roominfo_ptr).version = 1;
     (*roominfo_ptr).in_room = 0;
     (*roominfo_ptr).last_update = 0;
-    (*roominfo_ptr).reserved = 0;
+    (*roominfo_ptr).force_count = 0;
     (*roominfo_ptr).room_name = [0; MAX_ROOM_NAME_LEN];
     (*roominfo_ptr).map_name = [0; MAX_MAP_NAME_LEN];
+    (*roominfo_ptr).host_name = [0; MAX_HOST_NAME_LEN];
+    for i in 0..MAX_FORCES {
+        (*roominfo_ptr).force_names[i] = [0; MAX_FORCE_NAME_LEN];
+    }
 
     // Store the pointer globally
     ROOM_INFO.store(roominfo_ptr, Ordering::SeqCst);
