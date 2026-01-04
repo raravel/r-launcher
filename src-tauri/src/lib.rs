@@ -32,7 +32,8 @@ pub const MAX_MEMO_LEN: usize = 128;
 pub const MAX_ROOM_USERS: usize = 8;
 pub const MAX_NICKNAME_LEN: usize = 32;
 pub const MAX_ROOM_NAME_LEN: usize = 64;
-pub const MAX_MAP_NAME_LEN: usize = 64;
+pub const MAX_MAP_NAME_LEN: usize = 128;
+pub const MAX_HOST_NAME_LEN: usize = 64;
 pub const SHARED_MEMORY_NAME: &str = "Local\\SCMonitorAutoBan";
 pub const ROOMUSERS_MEMORY_NAME: &str = "Local\\SCMonitorRoomUsers";
 pub const ROOMINFO_MEMORY_NAME: &str = "Local\\SCMonitorRoomInfo";
@@ -108,6 +109,7 @@ pub struct RoomInfoData {
     pub reserved: u32,
     pub room_name: [u8; MAX_ROOM_NAME_LEN],
     pub map_name: [u8; MAX_MAP_NAME_LEN],
+    pub host_name: [u8; MAX_HOST_NAME_LEN],
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -118,6 +120,8 @@ pub struct RoomInfo {
     pub room_name: String,
     #[serde(rename = "mapName")]
     pub map_name: String,
+    #[serde(rename = "hostName")]
+    pub host_name: String,
 }
 
 // Latency shared memory structures (must match DLL exactly)
@@ -538,6 +542,7 @@ fn get_room_info() -> RoomInfo {
                         in_room: false,
                         room_name: String::new(),
                         map_name: String::new(),
+                        host_name: String::new(),
                     };
                 }
             };
@@ -549,6 +554,7 @@ fn get_room_info() -> RoomInfo {
                     in_room: false,
                     room_name: String::new(),
                     map_name: String::new(),
+                    host_name: String::new(),
                 };
             }
 
@@ -569,12 +575,20 @@ fn get_room_info() -> RoomInfo {
                 .unwrap_or(MAX_MAP_NAME_LEN);
             let map_name = String::from_utf8_lossy(&data.map_name[..map_name_end]).to_string();
 
+            // Extract host name
+            let host_name_end = data.host_name
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(MAX_HOST_NAME_LEN);
+            let host_name = String::from_utf8_lossy(&data.host_name[..host_name_end]).to_string();
+
             let _ = CloseHandle(h);
 
             RoomInfo {
                 in_room: data.in_room == 1,
                 room_name,
                 map_name,
+                host_name,
             }
         }
     }
@@ -584,6 +598,7 @@ fn get_room_info() -> RoomInfo {
             in_room: false,
             room_name: String::new(),
             map_name: String::new(),
+            host_name: String::new(),
         }
     }
 }
@@ -649,61 +664,100 @@ fn get_peer_latencies() -> Vec<PeerLatency> {
 }
 
 #[tauri::command]
-fn get_dll_logs(last_lines: Option<usize>) -> Vec<String> {
+async fn get_dll_logs(last_lines: Option<usize>) -> Vec<String> {
     let lines_to_read = last_lines.unwrap_or(100);
 
-    // Get TEMP directory
-    let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| {
-        std::env::var("TMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string())
-    });
+    // Run file I/O in blocking thread pool to avoid blocking async runtime
+    tauri::async_runtime::spawn_blocking(move || {
+        // Get TEMP directory
+        let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| {
+            std::env::var("TMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string())
+        });
 
-    let log_path = format!("{}\\sc_monitor_dll.log", temp_dir);
+        let log_path = format!("{}\\sc_monitor_dll.log", temp_dir);
 
-    match fs::File::open(&log_path) {
-        Ok(file) => {
-            let reader = BufReader::new(file);
-            let all_lines: Vec<String> = reader
-                .lines()
-                .filter_map(|l| l.ok())
-                .collect();
+        match fs::File::open(&log_path) {
+            Ok(file) => {
+                let reader = BufReader::new(file);
+                let all_lines: Vec<String> = reader
+                    .lines()
+                    .filter_map(|l| l.ok())
+                    .collect();
 
-            // Return last N lines
-            let start = all_lines.len().saturating_sub(lines_to_read);
-            all_lines[start..].to_vec()
+                // Return last N lines
+                let start = all_lines.len().saturating_sub(lines_to_read);
+                all_lines[start..].to_vec()
+            }
+            Err(_) => Vec::new(),
         }
-        Err(_) => Vec::new(),
-    }
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[tauri::command]
-fn is_dll_injected() -> bool {
-    // If StarCraft is not running, DLL can't be injected
-    #[cfg(windows)]
-    {
-        if find_process_by_name("StarCraft.exe").is_none() {
-            return false;
+async fn is_dll_injected() -> bool {
+    tauri::async_runtime::spawn_blocking(|| {
+        #[cfg(windows)]
+        {
+            // Find StarCraft process
+            let pid = match find_process_by_name("StarCraft.exe") {
+                Some(pid) => pid,
+                None => return false,
+            };
+
+            // Check if sc_hook_dll.dll is loaded in the process
+            return is_module_loaded_in_process(pid, "sc_hook_dll.dll");
         }
-    }
 
-    // Check if DLL log file exists and has been modified recently
-    let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| {
-        std::env::var("TMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string())
-    });
+        #[cfg(not(windows))]
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
 
-    let log_path = format!("{}\\sc_monitor_dll.log", temp_dir);
+#[cfg(windows)]
+fn is_module_loaded_in_process(pid: u32, module_name: &str) -> bool {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Module32First, Module32Next,
+        MODULEENTRY32, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
+    };
 
-    match fs::metadata(&log_path) {
-        Ok(metadata) => {
-            // Check if file was modified within last 5 seconds
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(elapsed) = modified.elapsed() {
-                    return elapsed.as_secs() < 5;
+    unsafe {
+        // Create snapshot of modules
+        let snapshot = match CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+            pid,
+        ) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+
+        let mut entry = MODULEENTRY32 {
+            dwSize: std::mem::size_of::<MODULEENTRY32>() as u32,
+            ..Default::default()
+        };
+
+        if Module32First(snapshot, &mut entry).is_ok() {
+            loop {
+                let name = std::ffi::CStr::from_ptr(entry.szModule.as_ptr())
+                    .to_string_lossy()
+                    .to_lowercase();
+
+                if name.contains(&module_name.to_lowercase()) {
+                    let _ = CloseHandle(snapshot);
+                    return true;
+                }
+
+                if Module32Next(snapshot, &mut entry).is_err() {
+                    break;
                 }
             }
-            // File exists but can't check modification time
-            true
         }
-        Err(_) => false,
+
+        let _ = CloseHandle(snapshot);
+        false
     }
 }
 
