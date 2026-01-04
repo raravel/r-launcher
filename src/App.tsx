@@ -111,6 +111,15 @@ function App() {
     }
   }, [dllLogs, autoScroll]);
 
+  // Reset DLL injection status when StarCraft is not running
+  useEffect(() => {
+    if (!starcraftPid && isDllInjected) {
+      console.log("[STATUS] StarCraft closed, resetting DLL injection status");
+      setIsDllInjected(false);
+      lastInjectedPidRef.current = null;
+    }
+  }, [starcraftPid, isDllInjected]);
+
   // Auto-inject DLL
   useEffect(() => {
     if (!autoInject) return;
@@ -120,44 +129,82 @@ function App() {
       if (!isMounted || isInjecting) return;
 
       try {
-        // Skip if already injected for this PID
-        if (starcraftPid && lastInjectedPidRef.current === starcraftPid) {
-          return;
-        }
-
+        // No StarCraft process
         if (!starcraftPid) {
-          lastInjectedPidRef.current = null;
-          setIsDllInjected(false);
+          if (lastInjectedPidRef.current !== null) {
+            console.log("[AUTO-INJECT] StarCraft closed, resetting state");
+            lastInjectedPidRef.current = null;
+            setIsDllInjected(false);
+          }
           return;
         }
 
-        // New PID detected, reset
+        // New PID detected - completely reset state
         if (lastInjectedPidRef.current !== null && lastInjectedPidRef.current !== starcraftPid) {
+          console.log(`[AUTO-INJECT] New PID detected: ${starcraftPid} (was ${lastInjectedPidRef.current}), resetting`);
           lastInjectedPidRef.current = null;
           setIsDllInjected(false);
         }
 
+        // If already processed this PID, just update status and don't try to inject again
+        if (lastInjectedPidRef.current === starcraftPid) {
+          const injected = await invoke<boolean>("is_dll_injected");
+          if (!isMounted) return;
+          console.log(`[AUTO-INJECT] Monitoring PID ${starcraftPid}, Injected: ${injected}`);
+          setIsDllInjected(injected);
+          return;
+        }
+
+        // New PID - check if DLL is already injected before attempting injection
         const injected = await invoke<boolean>("is_dll_injected");
         if (!isMounted) return;
+        console.log(`[AUTO-INJECT] Check result - PID: ${starcraftPid}, Injected: ${injected}`);
         setIsDllInjected(injected);
 
-        if (starcraftPid && !injected && lastInjectedPidRef.current !== starcraftPid) {
+        // Try to inject if not already injected
+        if (starcraftPid && !injected) {
           setIsInjecting(true);
+          const currentPid = starcraftPid; // Capture PID for closure
+
           try {
             const dllPath = await invoke<string>("get_default_dll_path");
             const result = await invoke<string>("inject_dll", { dllPath });
-            if (isMounted) {
-              setInjectStatus(result);
-              lastInjectedPidRef.current = starcraftPid;
-              setTimeout(() => setInjectStatus(""), 3000);
+            console.log("[AUTO-INJECT] Result:", result);
+
+            setInjectStatus(result);
+
+            // Check if injection was successful and verify
+            if (result.includes("successfully") || result.includes("SUCCESS")) {
+              console.log("[AUTO-INJECT] Injection succeeded, verifying DLL status...");
+
+              // Wait a bit for DLL to be registered in process, then verify
+              setTimeout(async () => {
+                try {
+                  const verifyInjected = await invoke<boolean>("is_dll_injected");
+                  console.log("[AUTO-INJECT] Verification result:", verifyInjected);
+                  setIsDllInjected(verifyInjected);
+
+                  // Only mark as processed if verification succeeded
+                  if (verifyInjected) {
+                    lastInjectedPidRef.current = currentPid;
+                    console.log("[AUTO-INJECT] Marked PID as processed:", currentPid);
+                  }
+                } catch (err) {
+                  console.error("[AUTO-INJECT] Verification failed:", err);
+                }
+              }, 500);
+            } else {
+              console.log("[AUTO-INJECT] Result does not indicate success:", result);
+              lastInjectedPidRef.current = currentPid; // Don't retry failed injections
             }
+
+            setTimeout(() => setInjectStatus(""), 3000);
           } catch (error) {
-            if (isMounted) {
-              setInjectStatus(`Auto-inject failed: ${error}`);
-              lastInjectedPidRef.current = starcraftPid;
-            }
+            console.error("[AUTO-INJECT] Error:", error);
+            setInjectStatus(`Auto-inject failed: ${error}`);
+            lastInjectedPidRef.current = currentPid;
           } finally {
-            if (isMounted) setIsInjecting(false);
+            setIsInjecting(false);
           }
         }
       } catch (error) {
@@ -219,9 +266,35 @@ function App() {
     try {
       const dllPath = await invoke<string>("get_default_dll_path");
       const result = await invoke<string>("inject_dll", { dllPath });
+      console.log("[INJECT] Result:", result);
       setInjectStatus(result);
+
+      // Check if injection was successful
+      if (result.includes("successfully") || result.includes("SUCCESS")) {
+        console.log("[INJECT] Injection succeeded, verifying DLL status...");
+
+        // Wait a bit for DLL to be registered in process, then verify
+        setTimeout(async () => {
+          const injected = await invoke<boolean>("is_dll_injected");
+          console.log("[INJECT] Verification result:", injected);
+          setIsDllInjected(injected);
+
+          // Only mark as processed if verification succeeded
+          if (injected && starcraftPid) {
+            lastInjectedPidRef.current = starcraftPid;
+            console.log("[INJECT] Marked PID as processed:", starcraftPid);
+          }
+        }, 500);
+      } else {
+        console.log("[INJECT] Result does not indicate success:", result);
+        if (starcraftPid) {
+          lastInjectedPidRef.current = starcraftPid; // Don't retry failed injections
+        }
+      }
+
       setTimeout(() => setInjectStatus(""), 5000);
     } catch (error) {
+      console.error("[INJECT] Error:", error);
       setInjectStatus(`Error: ${error}`);
     } finally {
       setIsInjecting(false);
