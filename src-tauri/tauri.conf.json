@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "",
     "frontendDist": "../dist"
   },
   "app": {
@@ -23,7 +23,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -31,6 +31,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "../target/release/sc_hook_dll.dll": "sc_hook_dll.dll"
+    },
     "windows": {
       "allowDowngrades": true
     }
