@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "build:dll": "cargo build --manifest-path sc-hook-dll/Cargo.toml --release --target i686-pc-windows-msvc",
-    "build:all": "npm run build:dll && npm run build",
+    "build:all": "npm run build:dll && npm run build && npm run tauri build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

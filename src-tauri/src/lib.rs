@@ -47,7 +47,7 @@ use windows::{
 pub const MAX_BAN_TARGETS: usize = 10;
 pub const MAX_BATTLETAG_LEN: usize = 64;
 pub const MAX_MEMO_LEN: usize = 128;
-pub const MAX_ROOM_USERS: usize = 8;
+pub const MAX_ROOM_USERS: usize = 100;
 pub const MAX_NICKNAME_LEN: usize = 32;
 pub const MAX_ROOM_NAME_LEN: usize = 64;
 pub const MAX_MAP_NAME_LEN: usize = 128;
@@ -127,6 +127,7 @@ pub struct RoomInfoData {
     pub in_room: u32,
     pub last_update: u32,
     pub force_count: u32,
+    pub room_id: [u8; 16],
     pub room_name: [u8; MAX_ROOM_NAME_LEN],
     pub map_name: [u8; MAX_MAP_NAME_LEN],
     pub host_name: [u8; MAX_HOST_NAME_LEN],
@@ -137,6 +138,8 @@ pub struct RoomInfoData {
 pub struct RoomInfo {
     #[serde(rename = "inRoom")]
     pub in_room: bool,
+    #[serde(rename = "roomId")]
+    pub room_id: String,
     #[serde(rename = "roomName")]
     pub room_name: String,
     #[serde(rename = "mapName")]
@@ -341,6 +344,45 @@ pub struct BlacklistEntry {
     pub memo: String,
 }
 
+// Room history entry structure
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RoomHistoryEntry {
+    pub timestamp: u64,
+    #[serde(rename = "roomInfo")]
+    pub room_info: RoomInfo,
+    pub users: Vec<RoomUser>,
+}
+
+// Maximum history entries to keep
+pub const MAX_HISTORY_ENTRIES: usize = 50;
+
+// History file path (in app data directory)
+fn get_history_file_path() -> PathBuf {
+    let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("r-launcher");
+    fs::create_dir_all(&path).ok();
+    path.push("room_history.json");
+    path
+}
+
+// Load history from file
+fn load_history_from_file() -> Vec<RoomHistoryEntry> {
+    let path = get_history_file_path();
+    match fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+// Save history to file
+fn save_history_to_file(entries: &[RoomHistoryEntry]) -> Result<(), String> {
+    let path = get_history_file_path();
+    let json = serde_json::to_string_pretty(entries).map_err(|e| e.to_string())?;
+    let mut file = fs::File::create(&path).map_err(|e| e.to_string())?;
+    file.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // Blacklist file path (in app data directory)
 fn get_blacklist_file_path() -> PathBuf {
     let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -482,6 +524,52 @@ fn update_blacklist_memo(state: State<AppState>, battletag: String, memo: String
     Ok(())
 }
 
+// ============================================================================
+// Room History Commands
+// ============================================================================
+
+#[tauri::command]
+fn get_room_history() -> Vec<RoomHistoryEntry> {
+    load_history_from_file()
+}
+
+#[tauri::command]
+fn add_room_history(entry: RoomHistoryEntry) -> Result<(), String> {
+    let mut entries = load_history_from_file();
+
+    // Check if entry with same timestamp exists (update case)
+    if let Some(existing) = entries.iter_mut().find(|e| e.timestamp == entry.timestamp) {
+        // Update existing entry
+        *existing = entry;
+    } else {
+        // Add new entry at the beginning (newest first)
+        entries.insert(0, entry);
+
+        // Limit to MAX_HISTORY_ENTRIES
+        if entries.len() > MAX_HISTORY_ENTRIES {
+            entries.truncate(MAX_HISTORY_ENTRIES);
+        }
+    }
+
+    save_history_to_file(&entries)
+}
+
+#[tauri::command]
+fn clear_room_history() -> Result<(), String> {
+    save_history_to_file(&[])
+}
+
+#[tauri::command]
+fn remove_room_history(timestamp: u64) -> Result<(), String> {
+    let mut entries = load_history_from_file();
+    entries.retain(|e| e.timestamp != timestamp);
+    save_history_to_file(&entries)
+}
+
+// ============================================================================
+// Room Users Commands
+// ============================================================================
+
 #[tauri::command]
 fn get_room_users(_state: State<AppState>) -> Vec<RoomUser> {
     #[cfg(windows)]
@@ -563,6 +651,7 @@ fn get_room_info() -> RoomInfo {
                 Err(_) => {
                     return RoomInfo {
                         in_room: false,
+                        room_id: String::new(),
                         room_name: String::new(),
                         map_name: String::new(),
                         host_name: String::new(),
@@ -576,6 +665,7 @@ fn get_room_info() -> RoomInfo {
                 let _ = CloseHandle(h);
                 return RoomInfo {
                     in_room: false,
+                    room_id: String::new(),
                     room_name: String::new(),
                     map_name: String::new(),
                     host_name: String::new(),
@@ -585,6 +675,14 @@ fn get_room_info() -> RoomInfo {
 
             let data_ptr = map_ptr.Value as *const RoomInfoData;
             let data = &*data_ptr;
+
+            // Extract room ID
+            let id_end = data.room_id.iter().position(|&b| b == 0).unwrap_or(16);
+            let room_id = if id_end > 0 {
+                data.room_id[..id_end].iter().map(|b| format!("{:02x}", b)).collect()
+            } else {
+                String::new()
+            };
 
             // Extract room name
             let room_name_end = data.room_name
@@ -624,6 +722,7 @@ fn get_room_info() -> RoomInfo {
 
             RoomInfo {
                 in_room: data.in_room == 1,
+                room_id,
                 room_name,
                 map_name,
                 host_name,
@@ -635,6 +734,7 @@ fn get_room_info() -> RoomInfo {
     {
         RoomInfo {
             in_room: false,
+            room_id: String::new(),
             room_name: String::new(),
             map_name: String::new(),
             host_name: String::new(),
@@ -701,38 +801,6 @@ fn get_peer_latencies() -> Vec<PeerLatency> {
     {
         Vec::new()
     }
-}
-
-#[tauri::command]
-async fn get_dll_logs(last_lines: Option<usize>) -> Vec<String> {
-    let lines_to_read = last_lines.unwrap_or(100);
-
-    // Run file I/O in blocking thread pool to avoid blocking async runtime
-    tauri::async_runtime::spawn_blocking(move || {
-        // Get TEMP directory
-        let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| {
-            std::env::var("TMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string())
-        });
-
-        let log_path = format!("{}\\sc_monitor_dll.log", temp_dir);
-
-        match fs::File::open(&log_path) {
-            Ok(file) => {
-                let reader = BufReader::new(file);
-                let all_lines: Vec<String> = reader
-                    .lines()
-                    .filter_map(|l| l.ok())
-                    .collect();
-
-                // Return last N lines
-                let start = all_lines.len().saturating_sub(lines_to_read);
-                all_lines[start..].to_vec()
-            }
-            Err(_) => Vec::new(),
-        }
-    })
-    .await
-    .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -824,17 +892,6 @@ fn is_module_loaded_in_process(pid: u32, module_name: &str) -> bool {
         let _ = CloseHandle(snapshot);
         false
     }
-}
-
-#[tauri::command]
-fn clear_dll_logs() -> Result<(), String> {
-    let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| {
-        std::env::var("TMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string())
-    });
-
-    let log_path = format!("{}\\sc_monitor_dll.log", temp_dir);
-
-    fs::write(&log_path, "").map_err(|e| e.to_string())
 }
 
 #[cfg(windows)]
@@ -1216,12 +1273,14 @@ pub fn run() {
             get_room_users,
             get_room_info,
             get_peer_latencies,
-            get_dll_logs,
             is_dll_injected,
-            clear_dll_logs,
             find_starcraft_process,
             inject_dll,
             get_default_dll_path,
+            get_room_history,
+            add_room_history,
+            clear_room_history,
+            remove_room_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

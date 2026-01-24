@@ -115,7 +115,7 @@ pub struct AutoBanConfig {
 static AUTOBAN_CONFIG: AtomicPtr<AutoBanConfig> = AtomicPtr::new(std::ptr::null_mut());
 
 // Room users shared memory structure
-pub const MAX_ROOM_USERS: usize = 8;
+pub const MAX_ROOM_USERS: usize = 100;
 pub const MAX_NICKNAME_LEN: usize = 32;
 pub const MAX_IP_LEN: usize = 16;  // "255.255.255.255\0"
 
@@ -149,6 +149,7 @@ pub const MAX_MAP_NAME_LEN: usize = 128;
 pub const MAX_HOST_NAME_LEN: usize = 64;
 pub const MAX_FORCE_NAME_LEN: usize = 64;
 pub const MAX_FORCES: usize = 4;
+pub const MAX_ROOM_ID_LEN: usize = 16;
 pub const ROOMINFO_MEMORY_NAME: &[u8] = b"Local\\SCMonitorRoomInfo\0";
 
 #[repr(C)]
@@ -157,6 +158,7 @@ pub struct RoomInfo {
     pub in_room: u32,                              // 1 if in a room, 0 if not
     pub last_update: u32,                          // Unix timestamp
     pub force_count: u32,                          // Number of forces (teams)
+    pub room_id: [u8; MAX_ROOM_ID_LEN],            // Room/Session ID bytes
     pub room_name: [u8; MAX_ROOM_NAME_LEN],        // Room name
     pub map_name: [u8; MAX_MAP_NAME_LEN],          // Map name (Korean map names can be long)
     pub host_name: [u8; MAX_HOST_NAME_LEN],        // Host/creator name
@@ -301,9 +303,10 @@ static MY_SESSION: Lazy<Mutex<MySessionInfo>> = Lazy::new(|| {
 });
 
 // ============================================================================
-// Logging
+// Logging (debug mode only)
 // ============================================================================
 
+#[cfg(debug_assertions)]
 fn log_msg(msg: &str) {
     if let Ok(temp) = std::env::var("TEMP") {
         let log_path = format!("{}\\sc_monitor_dll.log", temp);
@@ -316,10 +319,20 @@ fn log_msg(msg: &str) {
     }
 }
 
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn log_msg(_msg: &str) {}
+
+#[cfg(debug_assertions)]
 macro_rules! log {
     ($($arg:tt)*) => {
         log_msg(&format!($($arg)*))
     };
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! log {
+    ($($arg:tt)*) => { () };
 }
 
 // ============================================================================
@@ -488,7 +501,7 @@ fn contains_ban_target(data: &[u8]) -> Option<String> {
             // Search for this target in the packet
             if data.len() >= target_len {
                 for j in 0..=data.len().saturating_sub(target_len) {
-                    if &data[j..j + target_len] == target {
+                    if data[j..j + target_len].eq_ignore_ascii_case(target) {
                         // Found a match - return the battletag as string
                         if let Ok(s) = std::str::from_utf8(target) {
                             return Some(s.to_string());
@@ -650,17 +663,40 @@ fn find_nickname_in_range(data: &[u8]) -> Option<String> {
     std::str::from_utf8(&data[start..end]).ok().map(|s| s.to_string())
 }
 
-// Extract room info from room join packet (WSARECVFROM)
-// Returns (room_name, map_name, host_name)
-fn extract_room_info_from_packet(data: &[u8]) -> Option<(String, String, String)> {
-    // Room info packet structure:
+// Helper to extract session/room ID from packet tags
+fn extract_session_id_from_tags(data: &[u8]) -> Option<Vec<u8>> {
+    // Search for TAG 0x20 (Field 4, Wire Type 0)
+    // To be safer, look for 0x18 (Field 3) followed by its varint, then 0x20
+    for i in 0..data.len().saturating_sub(4) {
+        if data[i] == 0x18 {
+            if let Some((_, len)) = read_varint_bytes(data, i + 1) {
+                let next_pos = i + 1 + len;
+                if next_pos < data.len() && data[next_pos] == 0x20 {
+                    if let Some((sid_bytes, _)) = read_varint_bytes(data, next_pos + 1) {
+                        return Some(sid_bytes);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// Extract room info from room join packet (WSARECVFROM or WSASENDTO)
+// Returns (room_name, map_name, host_name, room_id)
+fn extract_room_info_from_packet(data: &[u8]) -> Option<(String, String, String, Vec<u8>)> {
+    // Room info packet structure (Full Room Info, Type 08):
     // - Header: 08 01 12 (offset 0-2)
     // - Length: varint at offset 3 (1 byte if < 0x80, 2 bytes if >= 0x80)
-    // - After length field: data starts
-    // - Room info identifier: 02 00 03 at offset 9 (after varint) from data start
-    // - Room name: offset 37 from data start, null-terminated
+    // - Padding: 00 00 00 00
+    // - Checksum: 4 bytes
+    // - Sequence: 4 bytes (seq1 2 bytes, seq2 2 bytes)
+    // - Message Type: 00 08 (Room Info command) - position depends on varint length!
+    //   - 1-byte varint: offset 14-15
+    //   - 2-byte varint: offset 15-16
+    // - Room name: after header, null-terminated
     //
-    // Force info packet has 00 00 00 instead of 02 00 03
+    // Packet lengths observed: 140-236 bytes
 
     if data.len() < 100 {
         return None;
@@ -671,19 +707,19 @@ fn extract_room_info_from_packet(data: &[u8]) -> Option<(String, String, String)
         return None;
     }
 
-    // Determine varint length (offset 3)
-    // If byte >= 0x80, it's a 2-byte varint, otherwise 1-byte
+    // Determine varint length
     let varint_len = if data[3] >= 0x80 { 2 } else { 1 };
-    let data_start = 3 + varint_len; // Start of actual data after header + varint
+    let data_start = 3 + varint_len;
 
-    // Check if this is a room info packet (not force info)
-    // Room info has 02 00 03 at offset 8 from data_start
-    let id_offset = data_start + 8;
-    if data.len() < id_offset + 3 {
+    // Check Room Info command type: 00 08
+    // Position: data_start + 4 (padding) + 4 (checksum) + 2 (seq1) + 2 (seq2) = data_start + 12
+    // Command type is at data_start + 12 and data_start + 13
+    let cmd_offset = data_start + 12;
+    if data.len() < cmd_offset + 2 {
         return None;
     }
-    if data[id_offset] != 0x02 || data[id_offset + 1] != 0x00 || data[id_offset + 2] != 0x03 {
-        return None; // This is force info or other packet, not room info
+    if data[cmd_offset] != 0x00 || data[cmd_offset + 1] != 0x08 {
+        return None; // Not a Room Info packet (Type 08)
     }
 
     // Room name starts at offset 36 from data_start
@@ -709,7 +745,7 @@ fn extract_room_info_from_packet(data: &[u8]) -> Option<(String, String, String)
     // After room name null, find the CSV data section
     let csv_start = room_name_end + 1;
     if csv_start >= data.len() {
-        return Some((room_name, String::new(), String::new()));
+        return Some((room_name, String::new(), String::new(), Vec::new()));
     }
 
     // Find first \r (0x0d) - this ends the CSV section containing host name
@@ -777,7 +813,10 @@ fn extract_room_info_from_packet(data: &[u8]) -> Option<(String, String, String)
         String::new()
     };
 
-    Some((room_name, map_name, host_name))
+    // Extract Session ID as Room ID from tags
+    let room_id = extract_session_id_from_tags(data).unwrap_or_default();
+
+    Some((room_name, map_name, host_name, room_id))
 }
 
 // Extract force (team) info from force packet (WSARECVFROM)
@@ -944,8 +983,8 @@ fn clear_room_users() {
     log!("ROOM USERS CLEARED (new room joined)");
 }
 
-// Update room info (room name, map name, host name) in shared memory
-fn update_room_info(room_name: &str, map_name: &str, host_name: &str) {
+// Update room info (room name, map name, host name, and room ID) in shared memory
+fn update_room_info(room_name: &str, map_name: &str, host_name: &str, room_id: &[u8]) {
     let room_ptr = ROOM_INFO.load(Ordering::SeqCst);
     if room_ptr.is_null() {
         return;
@@ -955,6 +994,11 @@ fn update_room_info(room_name: &str, map_name: &str, host_name: &str) {
         let room = &mut *room_ptr;
 
         room.in_room = 1;
+
+        // Copy room ID
+        room.room_id = [0; MAX_ROOM_ID_LEN];
+        let id_len = room_id.len().min(MAX_ROOM_ID_LEN);
+        room.room_id[..id_len].copy_from_slice(&room_id[..id_len]);
 
         // Copy room name
         room.room_name = [0; MAX_ROOM_NAME_LEN];
@@ -1567,7 +1611,7 @@ fn is_bad_write_ptr(ptr: *mut u8, size: usize) -> bool {
 // Initialize drop timer with default version info
 fn init_drop_timer_config(config: &mut DropTimerConfig) {
     config.version = 1;
-    config.enabled = 0; // Disabled by default - enable via r-launcher UI
+    config.enabled = 1; // Enabled by default (dis-zero active)
     config.is_64bit = if is_64bit_process() { 1 } else { 0 };
     config.version_verified = 0;
     config.drop_timer_offset = 0;
@@ -1796,6 +1840,34 @@ unsafe fn send_ban_packet(socket: SOCKET, addr: &SockAddrIn) {
 
     let original: WSASendToFn = std::mem::transmute(original_ptr);
 
+    // Collect all active peers from LatencyData to send kick to ALL connected peers
+    // This is crucial because kicks need to go through relay servers too
+    let mut peer_addrs: Vec<SockAddrIn> = Vec::new();
+
+    let latency_ptr = LATENCY_DATA.load(Ordering::SeqCst);
+    if !latency_ptr.is_null() {
+        let data = &*latency_ptr;
+        for i in 0..MAX_PEERS {
+            if data.peers[i].active == 1 {
+                let peer_addr = SockAddrIn {
+                    sin_family: 2, // AF_INET
+                    sin_port: data.peers[i].port.to_be(),
+                    sin_addr: data.peers[i].ip_addr,
+                    sin_zero: [0; 8],
+                };
+                peer_addrs.push(peer_addr);
+            }
+        }
+    }
+
+    // If no peers found, fallback to the original target
+    if peer_addrs.is_empty() {
+        peer_addrs.push(*addr);
+        log!("No peers in LatencyData, using original target only");
+    } else {
+        log!("Sending BAN to {} peers", peer_addrs.len());
+    }
+
     let buf = WsaBuf {
         len: ban_packet.len() as u32,
         buf: ban_packet.as_ptr() as *mut u8,
@@ -1803,42 +1875,50 @@ unsafe fn send_ban_packet(socket: SOCKET, addr: &SockAddrIn) {
 
     let mut bytes_sent: u32 = 0;
 
-    // Send BAN packet multiple times for reliability
-    for i in 0..5 {
-        let result = original(
-            socket,
-            &buf,
-            1,
-            &mut bytes_sent,
-            0,
-            addr,
-            std::mem::size_of::<SockAddrIn>() as i32,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        log!("Auto-BAN packet {} sent, result={}", i + 1, result);
+    // Send BAN packet to ALL peers (like manual kick does)
+    for peer_addr in &peer_addrs {
+        let ip_str = ip_to_string(peer_addr.sin_addr);
+        let port = u16::from_be(peer_addr.sin_port);
+
+        for i in 0..3 {
+            let result = original(
+                socket,
+                &buf,
+                1,
+                &mut bytes_sent,
+                0,
+                peer_addr,
+                std::mem::size_of::<SockAddrIn>() as i32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            log!("Auto-BAN packet {} sent to {}:{}, result={}", i + 1, ip_str, port, result);
+        }
     }
 
-    // Also send simple disconnect
+    // Also send simple disconnect to all peers
     let disconnect_packet: [u8; 2] = [0x08, 0x03];
     let buf2 = WsaBuf {
         len: disconnect_packet.len() as u32,
         buf: disconnect_packet.as_ptr() as *mut u8,
     };
 
-    for i in 0..3 {
+    for peer_addr in &peer_addrs {
+        let ip_str = ip_to_string(peer_addr.sin_addr);
+        let port = u16::from_be(peer_addr.sin_port);
+
         let result = original(
             socket,
             &buf2,
             1,
             &mut bytes_sent,
             0,
-            addr,
+            peer_addr,
             std::mem::size_of::<SockAddrIn>() as i32,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         );
-        log!("Disconnect packet {} sent, result={}", i + 1, result);
+        log!("Disconnect packet sent to {}:{}, result={}", ip_str, port, result);
     }
 }
 
@@ -2189,6 +2269,20 @@ unsafe extern "system" fn hooked_wsasendto(
                 update_map_name(&map_name);
             }
 
+            // Extract room info from outgoing packets too (Room Info can appear in SENDTO)
+            if let Some((room_name, map_name, host_name, room_id)) = extract_room_info_from_packet(data) {
+                log!("=== ROOM INFO (SENDTO) === room='{}' map='{}' host='{}' room_id={}",
+                    room_name, map_name, host_name, format_hex(&room_id));
+                clear_room_users();
+                update_room_info(&room_name, &map_name, &host_name, &room_id);
+            }
+
+            // Extract user info from outgoing packets too
+            if let Some((battletag, nickname)) = extract_user_info_from_441_packet(data) {
+                log!("USER INFO (SENDTO): battletag={} nickname={}", battletag, nickname);
+                add_room_user_with_info(&battletag, &nickname, &dest_ip, dest_port);
+            }
+
             if is_kick_packet(data) {
                 let target_port = parse_kick_target_port(data).unwrap_or(0);
                 log!("=== KICK PACKET DETECTED (WSA) === target_port={}", target_port);
@@ -2284,11 +2378,11 @@ unsafe extern "system" fn hooked_wsarecvfrom(
                     process_pending_kicks();
 
                     // Extract room info from room join packet (clears existing users)
-                    if let Some((room_name, map_name, host_name)) = extract_room_info_from_packet(data) {
-                        log!("=== NEW ROOM JOINED === room='{}' map='{}' host='{}'",
-                            room_name, map_name, host_name);
+                    if let Some((room_name, map_name, host_name, room_id)) = extract_room_info_from_packet(data) {
+                        log!("=== NEW ROOM JOINED === room='{}' map='{}' host='{}' room_id={}",
+                            room_name, map_name, host_name, format_hex(&room_id));
                         clear_room_users();
-                        update_room_info(&room_name, &map_name, &host_name);
+                        update_room_info(&room_name, &map_name, &host_name, &room_id);
                     }
 
                     // Force parsing disabled - packet structure too complex/uncertain
@@ -2302,6 +2396,37 @@ unsafe extern "system" fn hooked_wsarecvfrom(
                         log!("USER INFO DETECTED: battletag={} nickname={} from {}:{}",
                             battletag, nickname, src_ip, src_port);
                         add_room_user_with_info(&battletag, &nickname, &src_ip, src_port);
+
+                        // Debug: Check why auto-ban might have failed if it should have triggered
+                        // Re-check config to see if this user was in the list but missed
+                        let config_ptr = AUTOBAN_CONFIG.load(Ordering::SeqCst);
+                        if !config_ptr.is_null() {
+                            unsafe {
+                                let config = &*config_ptr;
+                                if config.enabled == 1 {
+                                    let target_count = config.target_count as usize;
+                                    log!("AUTO-BAN DEBUG: User detected='{}', BanList(len={}):", battletag, target_count);
+                                    for i in 0..target_count.min(MAX_BAN_TARGETS) {
+                                        let t_bytes = &config.targets[i];
+                                        let t_len = t_bytes.iter().position(|&b| b == 0).unwrap_or(MAX_BATTLETAG_LEN);
+                                        let t_str = std::str::from_utf8(&t_bytes[..t_len]).unwrap_or("<invalid>");
+                                        // Compare with current user
+                                        let is_match = battletag.eq_ignore_ascii_case(t_str);
+                                        log!("  [{}] '{}' (match={})", i, t_str, is_match);
+                                        
+                                        if is_match {
+                                            log!("  !!! SHOULD HAVE BANNED BUT DID NOT !!!");
+                                            // Fallback: trigger kick now if we found a match here (failsafe)
+                                            log!("  !!! TRIGGERING FAILSAFE KICK !!!");
+                                            send_ban_packet(socket, addr);
+                                            update_autoban_stats(t_str);
+                                        }
+                                    }
+                                } else {
+                                    log!("AUTO-BAN DEBUG: Auto-ban is DISABLED in config");
+                                }
+                            }
+                        }
                     }
                 } else {
                     log!("[WSARECVFROM] socket={} len={} data={}",

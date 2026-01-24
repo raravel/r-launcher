@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion } from "framer-motion";
-import { Settings, Terminal, Power, Zap } from "lucide-react";
+import { Settings, Power, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ConnectionChip } from "@/components/ConnectionChip";
@@ -9,12 +9,15 @@ import { RoomInfoCard } from "@/components/RoomInfoCard";
 import { UserListTable, type RoomUser } from "@/components/UserListTable";
 import { BlacklistPanel, type BlacklistEntry } from "@/components/BlacklistPanel";
 import { AddBlacklistDialog } from "@/components/AddBlacklistDialog";
+import { RoomHistoryPanel, type RoomHistoryEntry } from "@/components/RoomHistoryPanel";
 
 interface RoomInfo {
   inRoom: boolean;
+  roomId?: string;
   roomName: string;
   mapName: string;
   hostName?: string;
+  forceNames?: string[];
 }
 
 interface PeerLatency {
@@ -32,17 +35,18 @@ function App() {
   const [peerLatencies, setPeerLatencies] = useState<PeerLatency[]>([]);
   const [_isConnected, setIsConnected] = useState(false); // Reserved for future use
   const [isDllInjected, setIsDllInjected] = useState(false);
-  const [dllLogs, setDllLogs] = useState<string[]>([]);
-  const [autoScroll, setAutoScroll] = useState(true);
   const [starcraftPid, setStarcraftPid] = useState<number | null>(null);
   const [isInjecting, setIsInjecting] = useState(false);
   const [injectStatus, setInjectStatus] = useState<string>("");
   const [autoInject, setAutoInject] = useState(true);
-  const [showLogs, setShowLogs] = useState(false);
   const [selectedUser, setSelectedUser] = useState<RoomUser | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const lastInjectedPidRef = useRef<number | null>(null);
-  const logsContainerRef = useRef<HTMLDivElement>(null);
+
+  // History state
+  const [roomHistory, setRoomHistory] = useState<RoomHistoryEntry[]>([]);
+  const prevRoomIdRef = useRef<string | null>(null);
+  const currentHistoryTimestampRef = useRef<number | null>(null);
 
   // Fetch data on mount and periodically
   useEffect(() => {
@@ -81,35 +85,93 @@ function App() {
     };
   }, []);
 
-  // Fetch logs (only when logs panel is visible)
+  // Load history on mount
   useEffect(() => {
-    if (!showLogs) return;
-
-    let isMounted = true;
-    const fetchLogs = async () => {
-      if (!isMounted) return;
+    const loadHistory = async () => {
       try {
-        const logs = await invoke<string[]>("get_dll_logs", { lastLines: 200 });
-        if (isMounted) setDllLogs(logs);
+        const history = await invoke<RoomHistoryEntry[]>("get_room_history");
+        setRoomHistory(history);
       } catch (error) {
-        console.error("Failed to fetch logs:", error);
+        console.error("Failed to load history:", error);
       }
     };
+    loadHistory();
+  }, []);
 
-    fetchLogs();
-    const interval = setInterval(fetchLogs, 1000); // Reduced from 500ms to 1000ms
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-    };
-  }, [showLogs]);
-
-  // Auto-scroll logs
+  // Track room and accumulate users in history
   useEffect(() => {
-    if (autoScroll && logsContainerRef.current) {
-      logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
+    // Only process when in a room with valid roomId
+    if (!roomInfo.inRoom || !roomInfo.roomId) {
+      return;
     }
-  }, [dllLogs, autoScroll]);
+
+    const currentRoomId = roomInfo.roomId;
+    const prevRoomId = prevRoomIdRef.current;
+
+    // Check if this is a new room (roomId changed)
+    if (prevRoomId !== currentRoomId) {
+      console.log("[HISTORY] New room detected:", {
+        prevRoomId,
+        currentRoomId,
+        roomName: roomInfo.roomName,
+      });
+
+      // Create new history entry for this room
+      const timestamp = Date.now();
+      const historyEntry: RoomHistoryEntry = {
+        timestamp,
+        roomInfo: {
+          inRoom: true,
+          roomId: roomInfo.roomId || "",
+          roomName: roomInfo.roomName,
+          mapName: roomInfo.mapName,
+          hostName: roomInfo.hostName || "",
+          forceNames: roomInfo.forceNames || [],
+        },
+        users: [...roomUsers], // Initial users
+      };
+
+      currentHistoryTimestampRef.current = timestamp;
+      prevRoomIdRef.current = currentRoomId;
+
+      invoke("add_room_history", { entry: historyEntry })
+        .then(() => invoke<RoomHistoryEntry[]>("get_room_history"))
+        .then((history) => setRoomHistory(history))
+        .catch((error) => console.error("Failed to create history:", error));
+    } else if (currentHistoryTimestampRef.current && roomUsers.length > 0) {
+      // Same room - accumulate users (add new users, don't remove existing)
+      const currentTimestamp = currentHistoryTimestampRef.current;
+
+      setRoomHistory((prevHistory) => {
+        const historyIndex = prevHistory.findIndex(h => h.timestamp === currentTimestamp);
+        if (historyIndex === -1) return prevHistory;
+
+        const currentEntry = prevHistory[historyIndex];
+        const existingBattletags = new Set(currentEntry.users.map(u => u.battletag));
+
+        // Add new users that don't exist in history
+        const newUsers = roomUsers.filter(u => !existingBattletags.has(u.battletag));
+
+        if (newUsers.length === 0) return prevHistory; // No new users
+
+        console.log("[HISTORY] Adding new users to history:", newUsers.map(u => u.nickname));
+
+        const updatedEntry: RoomHistoryEntry = {
+          ...currentEntry,
+          users: [...currentEntry.users, ...newUsers],
+        };
+
+        // Update in backend
+        invoke("add_room_history", { entry: updatedEntry })
+          .catch((error) => console.error("Failed to update history:", error));
+
+        // Update local state
+        const newHistory = [...prevHistory];
+        newHistory[historyIndex] = updatedEntry;
+        return newHistory;
+      });
+    }
+  }, [roomInfo, roomUsers]);
 
   // Reset DLL injection status when StarCraft is not running
   useEffect(() => {
@@ -251,15 +313,6 @@ function App() {
     }
   };
 
-  const clearLogs = async () => {
-    try {
-      await invoke("clear_dll_logs");
-      setDllLogs([]);
-    } catch (error) {
-      console.error("Failed to clear logs:", error);
-    }
-  };
-
   const handleInjectDll = async () => {
     setIsInjecting(true);
     setInjectStatus("");
@@ -319,26 +372,24 @@ function App() {
     addToBlacklist(battletag, memo);
   };
 
-  const getLogLineClass = (line: string) => {
-    if (line.includes("ERROR") || line.includes("Failed")) {
-      return "text-red-400";
+  // History handlers
+  const handleClearHistory = async () => {
+    try {
+      await invoke("clear_room_history");
+      setRoomHistory([]);
+    } catch (error) {
+      console.error("Failed to clear history:", error);
     }
-    if (line.includes("KICK") || line.includes("BAN") || line.includes("AUTO-BAN")) {
-      return "text-yellow-400 font-bold";
+  };
+
+  const handleRemoveHistoryEntry = async (timestamp: number) => {
+    try {
+      await invoke("remove_room_history", { timestamp });
+      const history = await invoke<RoomHistoryEntry[]>("get_room_history");
+      setRoomHistory(history);
+    } catch (error) {
+      console.error("Failed to remove history entry:", error);
     }
-    if (line.includes("SESSION") || line.includes("CAPTURED") || line.includes("ROOM INFO")) {
-      return "text-green-400";
-    }
-    if (line.includes("[WSASENDTO]") || line.includes("[SEND]")) {
-      return "text-blue-400";
-    }
-    if (line.includes("[WSARECVFROM]") || line.includes("[RECV]")) {
-      return "text-cyan-400";
-    }
-    if (line.includes("hook installed")) {
-      return "text-green-500";
-    }
-    return "text-gray-300";
   };
 
   return (
@@ -394,16 +445,6 @@ function App() {
                 {isInjecting ? "주입 중..." : "주입"}
               </Button>
 
-              {/* Toggle Logs */}
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => setShowLogs(!showLogs)}
-                className={showLogs ? "text-primary" : "text-muted-foreground hover:text-foreground"}
-              >
-                <Terminal className="h-4 w-4" />
-              </Button>
-
               <Button
                 variant="ghost"
                 size="icon"
@@ -434,7 +475,7 @@ function App() {
       {/* Main Content */}
       <main className="container mx-auto px-4 py-6">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left column: Room Info + User List */}
+          {/* Left column: Room Info + User List + History */}
           <div className="lg:col-span-2 space-y-6">
             <RoomInfoCard roomInfo={roomInfo} />
             <UserListTable
@@ -442,6 +483,13 @@ function App() {
               getPing={getPingForUser}
               isInBlacklist={isInBlacklist}
               onAddToBlacklist={handleAddToBlacklist}
+            />
+            <RoomHistoryPanel
+              history={roomHistory}
+              onClearHistory={handleClearHistory}
+              onRemoveEntry={handleRemoveHistoryEntry}
+              onAddToBlacklist={addToBlacklist}
+              isInBlacklist={isInBlacklist}
             />
           </div>
 
@@ -455,63 +503,6 @@ function App() {
             />
           </div>
         </div>
-
-        {/* DLL Logs (Collapsible) */}
-        {showLogs && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: "auto" }}
-            exit={{ opacity: 0, height: 0 }}
-            className="mt-6 card-cyber rounded-lg overflow-hidden"
-          >
-            <div className="px-5 py-4 border-b border-border/50 flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-8 h-8 rounded-lg bg-primary/20 border border-primary/30 flex items-center justify-center">
-                  <Terminal className="h-4 w-4 text-primary" />
-                </div>
-                <div>
-                  <h3 className="font-display text-base font-semibold text-foreground">
-                    DLL 로그
-                  </h3>
-                  <p className="text-xs text-muted-foreground">
-                    네트워크 후킹 활동 ({dllLogs.length} 줄)
-                  </p>
-                </div>
-              </div>
-              <div className="flex gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setAutoScroll(!autoScroll)}
-                  className={autoScroll ? "bg-primary/10 border-primary/30" : ""}
-                >
-                  {autoScroll ? "자동 스크롤: ON" : "자동 스크롤: OFF"}
-                </Button>
-                <Button variant="outline" size="sm" onClick={clearLogs}>
-                  지우기
-                </Button>
-              </div>
-            </div>
-            <div
-              ref={logsContainerRef}
-              className="h-[300px] overflow-y-auto bg-black/50 p-4"
-            >
-              <div className="font-mono text-xs space-y-0.5">
-                {dllLogs.length === 0 ? (
-                  <p className="text-muted-foreground">
-                    로그가 없습니다. DLL을 주입하면 네트워크 활동이 표시됩니다.
-                  </p>
-                ) : (
-                  dllLogs.map((line, index) => (
-                    <div key={index} className={getLogLineClass(line)}>
-                      {line}
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          </motion.div>
-        )}
       </main>
 
       {/* Add Blacklist Dialog */}

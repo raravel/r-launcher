@@ -31,9 +31,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": {
-      "../target/release/sc_hook_dll.dll": "sc_hook_dll.dll"
-    },
     "windows": {
       "allowDowngrades": true
     }
