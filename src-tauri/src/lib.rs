@@ -410,7 +410,17 @@ fn save_blacklist_to_file(entries: &[BlacklistEntry]) -> Result<(), String> {
     Ok(())
 }
 
-// Sync blacklist to shared memory
+// Write blacklist targets to a simple text file for DLL to read (no entry limit)
+fn write_blacklist_targets_file(entries: &[BlacklistEntry]) {
+    let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("r-launcher");
+    let _ = fs::create_dir_all(&path);
+    path.push("blacklist_targets.txt");
+    let content: String = entries.iter().map(|e| e.battletag.as_str()).collect::<Vec<_>>().join("\n");
+    let _ = fs::write(&path, content);
+}
+
+// Sync blacklist to shared memory (stats + up to MAX_BAN_TARGETS for legacy)
 #[cfg(windows)]
 fn sync_blacklist_to_shared_memory(state: &AppState, entries: &[BlacklistEntry]) {
     state.update_config(|config| {
@@ -460,11 +470,6 @@ fn add_to_blacklist(state: State<AppState>, battletag: String, memo: Option<Stri
         return Err("Battletag already in blacklist".to_string());
     }
 
-    // Check max limit
-    if entries.len() >= MAX_BAN_TARGETS {
-        return Err("Blacklist is full".to_string());
-    }
-
     // Add new entry
     entries.push(BlacklistEntry {
         battletag,
@@ -474,7 +479,10 @@ fn add_to_blacklist(state: State<AppState>, battletag: String, memo: Option<Stri
     // Save to file
     save_blacklist_to_file(&entries)?;
 
-    // Sync to shared memory
+    // Write targets file for DLL (unlimited)
+    write_blacklist_targets_file(&entries);
+
+    // Sync to shared memory (legacy, up to MAX_BAN_TARGETS)
     #[cfg(windows)]
     sync_blacklist_to_shared_memory(&state, &entries);
 
@@ -495,7 +503,10 @@ fn remove_from_blacklist(state: State<AppState>, battletag: String) -> Result<()
     // Save to file
     save_blacklist_to_file(&entries)?;
 
-    // Sync to shared memory
+    // Write targets file for DLL (unlimited)
+    write_blacklist_targets_file(&entries);
+
+    // Sync to shared memory (legacy, up to MAX_BAN_TARGETS)
     #[cfg(windows)]
     sync_blacklist_to_shared_memory(&state, &entries);
 
@@ -517,7 +528,10 @@ fn update_blacklist_memo(state: State<AppState>, battletag: String, memo: String
     // Save to file
     save_blacklist_to_file(&entries)?;
 
-    // Sync to shared memory
+    // Write targets file for DLL (unlimited)
+    write_blacklist_targets_file(&entries);
+
+    // Sync to shared memory (legacy, up to MAX_BAN_TARGETS)
     #[cfg(windows)]
     sync_blacklist_to_shared_memory(&state, &entries);
 
@@ -1261,6 +1275,12 @@ fn get_default_dll_path() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Generate blacklist_targets.txt from existing blacklist.json on startup
+    let entries = load_blacklist_from_file();
+    if !entries.is_empty() {
+        write_blacklist_targets_file(&entries);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())

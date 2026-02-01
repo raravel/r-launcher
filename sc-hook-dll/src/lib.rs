@@ -278,6 +278,9 @@ struct PendingKick {
 
 static PENDING_KICK: Lazy<Mutex<Option<PendingKick>>> = Lazy::new(|| Mutex::new(None));
 
+// File-based blacklist cache (unlimited entries, refreshed periodically)
+static BLACKLIST_CACHE: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
 // Total kicks to send and interval
 const TOTAL_KICKS: u32 = 4;
 const KICK_INTERVAL_MS: u64 = 1000;
@@ -465,47 +468,60 @@ fn is_kick_packet(data: &[u8]) -> bool {
         && data[21] == 0x01
 }
 
-// Check if packet contains any auto-ban target battletag
+// Load blacklist targets from file written by Rust app (unlimited entries)
+fn load_blacklist_from_file() -> Vec<Vec<u8>> {
+    let local_app_data = match std::env::var("LOCALAPPDATA") {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let path = format!("{}\\r-launcher\\blacklist_targets.txt", local_app_data);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            content.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| line.trim().as_bytes().to_vec())
+                .collect()
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+// Refresh the in-memory blacklist cache from file
+fn refresh_blacklist_cache() {
+    let targets = load_blacklist_from_file();
+    *BLACKLIST_CACHE.lock() = targets;
+}
+
+// Check if packet contains any auto-ban target battletag (file-based, unlimited)
 // Returns the matched battletag if found, None otherwise
 fn contains_ban_target(data: &[u8]) -> Option<String> {
+    // Check if auto-ban is enabled via shared memory config
     let config_ptr = AUTOBAN_CONFIG.load(Ordering::SeqCst);
-    if config_ptr.is_null() {
+    if !config_ptr.is_null() {
+        unsafe {
+            if (*config_ptr).enabled == 0 {
+                return None;
+            }
+        }
+    }
+
+    let cache = BLACKLIST_CACHE.lock();
+    if cache.is_empty() {
         return None;
     }
 
-    unsafe {
-        let config = &*config_ptr;
-
-        // Check if auto-ban is enabled
-        if config.enabled == 0 {
-            return None;
+    for target in cache.iter() {
+        let target_len = target.len();
+        if target_len == 0 {
+            continue;
         }
 
-        let target_count = config.target_count as usize;
-        if target_count == 0 || target_count > MAX_BAN_TARGETS {
-            return None;
-        }
-
-        // Check each target
-        for i in 0..target_count {
-            let target_bytes = &config.targets[i];
-
-            // Find null terminator to get actual string length
-            let target_len = target_bytes.iter().position(|&b| b == 0).unwrap_or(MAX_BATTLETAG_LEN);
-            if target_len == 0 {
-                continue;
-            }
-
-            let target = &target_bytes[..target_len];
-
-            // Search for this target in the packet
-            if data.len() >= target_len {
-                for j in 0..=data.len().saturating_sub(target_len) {
-                    if data[j..j + target_len].eq_ignore_ascii_case(target) {
-                        // Found a match - return the battletag as string
-                        if let Ok(s) = std::str::from_utf8(target) {
-                            return Some(s.to_string());
-                        }
+        // Search for this target in the packet
+        if data.len() >= target_len {
+            for j in 0..=data.len().saturating_sub(target_len) {
+                if data[j..j + target_len].eq_ignore_ascii_case(target) {
+                    if let Ok(s) = std::str::from_utf8(target) {
+                        return Some(s.to_string());
                     }
                 }
             }
@@ -981,6 +997,31 @@ fn clear_room_users() {
     }
 
     log!("ROOM USERS CLEARED (new room joined)");
+}
+
+// Clear all latency peers (called when joining a new room to prevent stale peer data)
+fn clear_latency_peers() {
+    let latency_ptr = LATENCY_DATA.load(Ordering::SeqCst);
+    if latency_ptr.is_null() {
+        return;
+    }
+
+    unsafe {
+        let data = &mut *latency_ptr;
+        for i in 0..MAX_PEERS {
+            data.peers[i].active = 0;
+            data.peers[i].ip_addr = 0;
+            data.peers[i].port = 0;
+            data.peers[i].last_send_time = 0;
+            data.peers[i].last_recv_time = 0;
+            data.peers[i].current_rtt_us = 0;
+            data.peers[i].avg_rtt_us = 0;
+            data.peers[i].sample_count = 0;
+        }
+        data.peer_count = 0;
+    }
+
+    log!("LATENCY PEERS CLEARED (new room joined)");
 }
 
 // Update room info (room name, map name, host name, and room ID) in shared memory
@@ -1840,10 +1881,16 @@ unsafe fn send_ban_packet(socket: SOCKET, addr: &SockAddrIn) {
 
     let original: WSASendToFn = std::mem::transmute(original_ptr);
 
-    // Collect all active peers from LatencyData to send kick to ALL connected peers
-    // This is crucial because kicks need to go through relay servers too
+    // Always include the actual source address of the detected packet first.
+    // This is the relay address the opponent is actually using right now.
     let mut peer_addrs: Vec<SockAddrIn> = Vec::new();
+    peer_addrs.push(*addr);
 
+    let src_ip = ip_to_string(addr.sin_addr);
+    let src_port = u16::from_be(addr.sin_port);
+    log!("BAN primary target (packet source): {}:{}", src_ip, src_port);
+
+    // Also collect active peers from LatencyData (skip duplicates)
     let latency_ptr = LATENCY_DATA.load(Ordering::SeqCst);
     if !latency_ptr.is_null() {
         let data = &*latency_ptr;
@@ -1855,18 +1902,18 @@ unsafe fn send_ban_packet(socket: SOCKET, addr: &SockAddrIn) {
                     sin_addr: data.peers[i].ip_addr,
                     sin_zero: [0; 8],
                 };
-                peer_addrs.push(peer_addr);
+                // Skip if same as the source address already added
+                let is_dup = peer_addrs.iter().any(|existing|
+                    existing.sin_addr == peer_addr.sin_addr && existing.sin_port == peer_addr.sin_port
+                );
+                if !is_dup {
+                    peer_addrs.push(peer_addr);
+                }
             }
         }
     }
 
-    // If no peers found, fallback to the original target
-    if peer_addrs.is_empty() {
-        peer_addrs.push(*addr);
-        log!("No peers in LatencyData, using original target only");
-    } else {
-        log!("Sending BAN to {} peers", peer_addrs.len());
-    }
+    log!("Sending BAN to {} addresses (including packet source)", peer_addrs.len());
 
     let buf = WsaBuf {
         len: ban_packet.len() as u32,
@@ -2274,6 +2321,7 @@ unsafe extern "system" fn hooked_wsasendto(
                 log!("=== ROOM INFO (SENDTO) === room='{}' map='{}' host='{}' room_id={}",
                     room_name, map_name, host_name, format_hex(&room_id));
                 clear_room_users();
+                clear_latency_peers();
                 update_room_info(&room_name, &map_name, &host_name, &room_id);
             }
 
@@ -2382,6 +2430,7 @@ unsafe extern "system" fn hooked_wsarecvfrom(
                         log!("=== NEW ROOM JOINED === room='{}' map='{}' host='{}' room_id={}",
                             room_name, map_name, host_name, format_hex(&room_id));
                         clear_room_users();
+                        clear_latency_peers();
                         update_room_info(&room_name, &map_name, &host_name, &room_id);
                     }
 
@@ -2397,35 +2446,27 @@ unsafe extern "system" fn hooked_wsarecvfrom(
                             battletag, nickname, src_ip, src_port);
                         add_room_user_with_info(&battletag, &nickname, &src_ip, src_port);
 
-                        // Debug: Check why auto-ban might have failed if it should have triggered
-                        // Re-check config to see if this user was in the list but missed
-                        let config_ptr = AUTOBAN_CONFIG.load(Ordering::SeqCst);
-                        if !config_ptr.is_null() {
-                            unsafe {
-                                let config = &*config_ptr;
-                                if config.enabled == 1 {
-                                    let target_count = config.target_count as usize;
-                                    log!("AUTO-BAN DEBUG: User detected='{}', BanList(len={}):", battletag, target_count);
-                                    for i in 0..target_count.min(MAX_BAN_TARGETS) {
-                                        let t_bytes = &config.targets[i];
-                                        let t_len = t_bytes.iter().position(|&b| b == 0).unwrap_or(MAX_BATTLETAG_LEN);
-                                        let t_str = std::str::from_utf8(&t_bytes[..t_len]).unwrap_or("<invalid>");
-                                        // Compare with current user
-                                        let is_match = battletag.eq_ignore_ascii_case(t_str);
-                                        log!("  [{}] '{}' (match={})", i, t_str, is_match);
-                                        
-                                        if is_match {
-                                            log!("  !!! SHOULD HAVE BANNED BUT DID NOT !!!");
-                                            // Fallback: trigger kick now if we found a match here (failsafe)
-                                            log!("  !!! TRIGGERING FAILSAFE KICK !!!");
-                                            send_ban_packet(socket, addr);
-                                            update_autoban_stats(t_str);
-                                        }
+                        // Failsafe: re-check blacklist cache for this user
+                        let matched_target = {
+                            let cache = BLACKLIST_CACHE.lock();
+                            log!("AUTO-BAN DEBUG: User detected='{}', BanList(len={}):", battletag, cache.len());
+                            let mut found = None;
+                            for (i, target) in cache.iter().enumerate() {
+                                if let Ok(t_str) = std::str::from_utf8(target) {
+                                    let is_match = battletag.eq_ignore_ascii_case(t_str);
+                                    log!("  [{}] '{}' (match={})", i, t_str, is_match);
+                                    if is_match {
+                                        found = Some(t_str.to_string());
+                                        break;
                                     }
-                                } else {
-                                    log!("AUTO-BAN DEBUG: Auto-ban is DISABLED in config");
                                 }
                             }
+                            found
+                        };
+                        if let Some(ref matched) = matched_target {
+                            log!("  !!! TRIGGERING FAILSAFE KICK !!!");
+                            send_ban_packet(socket, addr);
+                            update_autoban_stats(matched);
                         }
                     }
                 } else {
@@ -2911,6 +2952,12 @@ unsafe extern "system" fn command_thread(_param: *mut c_void) -> u32 {
     // Initialize high-precision timer
     init_timer();
 
+    // Load blacklist cache on startup
+    refresh_blacklist_cache();
+    log!("Blacklist cache loaded: {} entries", BLACKLIST_CACHE.lock().len());
+
+    let mut blacklist_refresh_counter: u32 = 0;
+
     while COMMAND_THREAD_RUNNING.load(Ordering::SeqCst) {
         {
             let kick_data = KICK_DATA.lock();
@@ -2919,6 +2966,13 @@ unsafe extern "system" fn command_thread(_param: *mut c_void) -> u32 {
 
         // Reset drop timer (dis-zero functionality)
         reset_drop_timer();
+
+        // Refresh blacklist cache from file every ~2 seconds (40 * 50ms)
+        blacklist_refresh_counter += 1;
+        if blacklist_refresh_counter >= 40 {
+            blacklist_refresh_counter = 0;
+            refresh_blacklist_cache();
+        }
 
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
