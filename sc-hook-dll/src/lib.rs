@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use windows::core::PCSTR;
 use windows::Win32::Foundation::{BOOL, HANDLE, HMODULE, TRUE};
@@ -295,6 +295,13 @@ static BLACKLIST_CACHE: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec:
 const TOTAL_KICKS: u32 = 4;
 const KICK_INTERVAL_MS: u64 = 1000;
 
+// Peer player_id to battletag mapping for P2P IP resolution
+// Each entry: (peer_player_id_bytes, matched_battletag_or_None)
+static PEER_BATTLETAG_MAP: Lazy<Mutex<Vec<(Vec<u8>, Option<String>)>>> = Lazy::new(|| Mutex::new(Vec::new()));
+// Pending clear flag: set by clear_room_users(), consumed by register_peer_player_id()
+// This prevents premature clearing of peer map before USER INFOs arrive
+static PEER_MAP_PENDING_CLEAR: AtomicBool = AtomicBool::new(false);
+
 // ============================================================================
 // My Session Info (for kick packet construction)
 // ============================================================================
@@ -361,7 +368,7 @@ fn format_hex(data: &[u8]) -> String {
 }
 
 fn ip_to_string(addr: u32) -> String {
-    let bytes = addr.to_be_bytes();
+    let bytes = addr.to_ne_bytes();
     format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
 }
 
@@ -689,6 +696,290 @@ fn find_nickname_in_range(data: &[u8]) -> Option<String> {
     std::str::from_utf8(&data[start..end]).ok().map(|s| s.to_string())
 }
 
+// ============================================================================
+// P2P IP-to-Battletag Matching
+// ============================================================================
+
+// Decode varint bytes into a u64 value
+fn decode_varint(bytes: &[u8]) -> u64 {
+    let mut val: u64 = 0;
+    for (j, &b) in bytes.iter().enumerate() {
+        val |= ((b & 0x7f) as u64) << (7 * j);
+    }
+    val
+}
+
+// Extract peer player_id from relay packet's 5a sub-message
+// Pattern: ... 48 [timestamp_varint] 5a [len] 08 [peer_or_my_id] 10 [session_id] ...
+// The 48+5a pattern only appears in packets with full peer connection info
+fn extract_peer_player_id_from_relay(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 20 || data[0] != 0x08 || data[1] != 0x01 {
+        return None;
+    }
+
+    // Extract my player_id from outer packet's field 3 (tag 0x18)
+    // More reliable than MY_SESSION which may be stale from previous session
+    let my_player_id_from_packet = {
+        let mut pos = 2usize;
+        let mut found: Option<Vec<u8>> = None;
+        while pos < data.len() {
+            let tag = data[pos];
+            pos += 1;
+            let wire_type = tag & 0x07;
+            match wire_type {
+                0 => {
+                    if let Some((val_bytes, val_len)) = read_varint_bytes(data, pos) {
+                        if tag == 0x18 {
+                            found = Some(val_bytes);
+                            break;
+                        }
+                        pos += val_len;
+                    } else {
+                        break;
+                    }
+                }
+                2 => {
+                    if let Some((len_bytes, len_size)) = read_varint_bytes(data, pos) {
+                        let len_val = decode_varint(&len_bytes) as usize;
+                        pos += len_size + len_val;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        found
+    };
+
+    // Look for pattern: 48 [varint] 5a [len] [sub-message]
+    // The 48 tag (field 9) always precedes 5a (field 11) in relay connection info
+    for i in 0..data.len().saturating_sub(10) {
+        if data[i] != 0x48 {
+            continue;
+        }
+
+        // Read timestamp varint after 48
+        let (_, ts_len) = read_varint_bytes(data, i + 1)?;
+        let pos_5a = i + 1 + ts_len;
+
+        if pos_5a >= data.len() || data[pos_5a] != 0x5a {
+            continue;
+        }
+
+        // Read sub-message length
+        let (len_bytes, len_size) = read_varint_bytes(data, pos_5a + 1)?;
+        let len_val = decode_varint(&len_bytes) as usize;
+        let sub_start = pos_5a + 1 + len_size;
+        let sub_end = sub_start + len_val;
+
+        if sub_end > data.len() || len_val < 5 {
+            continue;
+        }
+
+        let sub_msg = &data[sub_start..sub_end];
+
+        // Parse sub-message fields to find peer_player_id
+        // Field 1 (tag 08) and Field 6 (tag 30) can both contain player_ids
+        // The one that's NOT my player_id is the peer's
+        let mut field1: Option<Vec<u8>> = None;
+        let mut field6: Option<Vec<u8>> = None;
+        let mut pos = 0;
+
+        while pos < sub_msg.len() {
+            let tag = sub_msg[pos];
+            pos += 1;
+
+            // All fields in this sub-message are varints (wire type 0)
+            if tag & 0x07 != 0 {
+                break;
+            }
+
+            if let Some((val, len)) = read_varint_bytes(sub_msg, pos) {
+                match tag {
+                    0x08 => field1 = Some(val),
+                    0x30 => field6 = Some(val),
+                    _ => {} // skip fields 2,3,4,5,7,12
+                }
+                pos += len;
+            } else {
+                break;
+            }
+        }
+
+        // Use my_player_id from outer packet field 3 if available, fall back to MY_SESSION
+        let my_id = if let Some(ref id) = my_player_id_from_packet {
+            id.clone()
+        } else {
+            let session = MY_SESSION.lock();
+            if !session.captured {
+                return None;
+            }
+            session.player_id.clone()
+        };
+
+        // Return whichever ID is NOT my player_id
+        if let Some(ref f1) = field1 {
+            if *f1 != my_id && f1.len() >= 2 {
+                return Some(f1.clone());
+            }
+        }
+        if let Some(ref f6) = field6 {
+            if *f6 != my_id && f6.len() >= 2 {
+                return Some(f6.clone());
+            }
+        }
+
+        return None;
+    }
+    None
+}
+
+// Extract peer player_id from P2P handshake packet (type 0x06)
+// Structure: 08 06 12 [len] { 08 [timestamp] 10 [counter] 18 [peer_player_id] 20 [session_id] }
+fn extract_peer_id_from_p2p_handshake(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 10 || data[0] != 0x08 || data[1] != 0x06 || data[2] != 0x12 {
+        return None;
+    }
+
+    // Read sub-message length
+    let (len_bytes, len_size) = read_varint_bytes(data, 3)?;
+    let len_val = decode_varint(&len_bytes) as usize;
+    let sub_start = 3 + len_size;
+    let sub_end = sub_start + len_val;
+    if sub_end > data.len() {
+        return None;
+    }
+
+    let sub_msg = &data[sub_start..sub_end];
+
+    // Parse sub-message: skip fields until we find tag 0x18 (field 3 = peer_player_id)
+    let mut pos = 0;
+    while pos < sub_msg.len() {
+        let tag = sub_msg[pos];
+        pos += 1;
+
+        if tag == 0x18 {
+            // Field 3: peer_player_id (varint)
+            if let Some((peer_id, _)) = read_varint_bytes(sub_msg, pos) {
+                if peer_id.len() >= 2 {
+                    return Some(peer_id);
+                }
+            }
+            return None;
+        }
+
+        // Skip varint fields (wire type 0)
+        if tag & 0x07 == 0 {
+            if let Some((_, len)) = read_varint_bytes(sub_msg, pos) {
+                pos += len;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    None
+}
+
+// Register a new peer player_id (called when relay connection info received)
+fn register_peer_player_id(peer_id: &[u8]) {
+    let mut map = PEER_BATTLETAG_MAP.lock();
+
+    // Consume pending clear flag: clear old entries before registering new ones
+    if PEER_MAP_PENDING_CLEAR.swap(false, Ordering::SeqCst) {
+        log!("P2P PEER MAP: deferred clear (new session starting)");
+        map.clear();
+    }
+
+    for (existing_id, _) in map.iter() {
+        if existing_id == peer_id {
+            return; // Already registered
+        }
+    }
+    log!("P2P PEER REGISTERED: player_id={:02x?}", peer_id);
+    map.push((peer_id.to_vec(), None));
+}
+
+// Try to match a battletag to an unmatched peer player_id
+fn match_peer_to_battletag(battletag: &str) {
+    let mut map = PEER_BATTLETAG_MAP.lock();
+
+    // Check if this battletag is already matched
+    for (_, existing_bt) in map.iter() {
+        if let Some(bt) = existing_bt {
+            if bt == battletag {
+                return;
+            }
+        }
+    }
+
+    // Find first unmatched peer_player_id and assign this battletag
+    for (peer_id, bt_slot) in map.iter_mut() {
+        if bt_slot.is_none() {
+            log!("P2P PEER MATCHED: player_id={:02x?} -> battletag={}", peer_id, battletag);
+            *bt_slot = Some(battletag.to_string());
+            return;
+        }
+    }
+}
+
+// Resolve P2P IP: given a peer_player_id from handshake, find battletag and update room user IP
+fn resolve_p2p_ip(peer_id: &[u8], real_ip: &str, real_port: u16) {
+    let map = PEER_BATTLETAG_MAP.lock();
+
+    let battletag = map.iter()
+        .find(|(id, _)| id == peer_id)
+        .and_then(|(_, bt)| bt.clone());
+
+    drop(map);
+
+    if let Some(bt) = battletag {
+        log!("P2P IP RESOLVED: {} -> {}:{}", bt, real_ip, real_port);
+        update_room_user_ip(&bt, real_ip, real_port);
+    } else {
+        log!("P2P IP UNRESOLVED: player_id={:02x?} -> {}:{} (no battletag match yet)", peer_id, real_ip, real_port);
+    }
+}
+
+// Update a room user's IP address (from relay IP to real P2P IP)
+fn update_room_user_ip(battletag: &str, new_ip: &str, new_port: u16) {
+    let room_ptr = ROOM_USERS.load(Ordering::SeqCst);
+    if room_ptr.is_null() {
+        return;
+    }
+
+    unsafe {
+        let room = &mut *room_ptr;
+
+        for i in 0..MAX_ROOM_USERS {
+            if room.users[i].active == 1 {
+                let existing_len = room.users[i].battletag.iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(MAX_BATTLETAG_LEN);
+                if let Ok(existing) = std::str::from_utf8(&room.users[i].battletag[..existing_len]) {
+                    if existing == battletag {
+                        let ip_bytes = new_ip.as_bytes();
+                        let ip_len = ip_bytes.len().min(MAX_IP_LEN - 1);
+                        room.users[i].ip_address = [0; MAX_IP_LEN];
+                        room.users[i].ip_address[..ip_len].copy_from_slice(&ip_bytes[..ip_len]);
+                        room.users[i].port = new_port;
+
+                        if let Ok(duration) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                            room.last_update = duration.as_secs() as u32;
+                        }
+
+                        log!("ROOM USER IP UPDATED: {} -> {}:{}", battletag, new_ip, new_port);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Helper to extract session/room ID from packet tags
 fn extract_session_id_from_tags(data: &[u8]) -> Option<Vec<u8>> {
     // Search for TAG 0x20 (Field 4, Wire Type 0)
@@ -1005,6 +1296,11 @@ fn clear_room_users() {
             room.last_update = duration.as_secs() as u32;
         }
     }
+
+    // Mark P2P peer map for deferred clearing
+    // Don't clear immediately because peer registrations happen BEFORE room clear,
+    // and USER INFOs (which match battletags) arrive AFTER room clear
+    PEER_MAP_PENDING_CLEAR.store(true, Ordering::SeqCst);
 
     log!("ROOM USERS CLEARED (new room joined)");
 }
@@ -2201,6 +2497,31 @@ const GENERIC_WRITE: u32 = 0x40000000;
 /// Set when StarCraft writes (saves) a downloaded map file.
 static ALLOWED_MAP_FILE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
+/// Epoch millis until which map scan blocking is active.
+/// Only blocks during a brief window after room join to avoid OneDrive lag.
+/// Map browsing for room creation happens BEFORE room join, so it's unaffected.
+static MAP_SCAN_BLOCK_UNTIL: AtomicU64 = AtomicU64::new(0);
+const MAP_SCAN_BLOCK_DURATION_MS: u64 = 10_000; // 10 seconds
+
+fn activate_map_scan_block() {
+    if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let until = d.as_millis() as u64 + MAP_SCAN_BLOCK_DURATION_MS;
+        MAP_SCAN_BLOCK_UNTIL.store(until, Ordering::SeqCst);
+        log!("MAP SCAN BLOCK ACTIVATED (10s window)");
+    }
+}
+
+fn is_map_scan_blocked() -> bool {
+    let until = MAP_SCAN_BLOCK_UNTIL.load(Ordering::SeqCst);
+    if until == 0 {
+        return false;
+    }
+    if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        return (d.as_millis() as u64) < until;
+    }
+    false
+}
+
 /// Extract just the filename from a full path (lowercase).
 fn extract_filename(path: &str) -> &str {
     path.rsplit(|c: char| c == '\\' || c == '/').next().unwrap_or("")
@@ -2217,7 +2538,7 @@ unsafe extern "system" fn hooked_create_file_w(
 ) -> *mut c_void {
     let path = wstr_to_lowercase(lp_file_name);
 
-    if is_maps_scan_path(&path) {
+    if is_maps_scan_path(&path) && is_map_scan_blocked() {
         let filename = extract_filename(&path);
 
         let should_block = if dw_desired_access & GENERIC_WRITE != 0 {
@@ -2260,7 +2581,7 @@ unsafe extern "system" fn hooked_create_file_a(
 ) -> *mut c_void {
     let path = astr_to_lowercase(lp_file_name);
 
-    if is_maps_scan_path(&path) {
+    if is_maps_scan_path(&path) && is_map_scan_blocked() {
         let filename = extract_filename(&path);
 
         let should_block = if dw_desired_access & GENERIC_WRITE != 0 {
@@ -2547,13 +2868,29 @@ unsafe extern "system" fn hooked_wsasendto(
                     room_name, map_name, host_name, format_hex(&room_id));
                 clear_room_users();
                 clear_latency_peers();
+                activate_map_scan_block();
                 update_room_info(&room_name, &map_name, &host_name, &room_id);
             }
 
+            // Register peer player_id from relay connection info packets
+            if let Some(peer_id) = extract_peer_player_id_from_relay(data) {
+                register_peer_player_id(&peer_id);
+            }
+
+            // Detect P2P handshake (type 0x06) sent to port 6112
+            // The SENT handshake contains the PEER's player_id
+            if dest_port == 6112 {
+                if let Some(peer_id) = extract_peer_id_from_p2p_handshake(data) {
+                    resolve_p2p_ip(&peer_id, &dest_ip, dest_port);
+                }
+            }
+
             // Extract user info from outgoing packets too
+            // SENDTO USER INFO is always our own battletag, so use 127.0.0.1
+            // (relay server IP should not be stored as our own IP)
             if let Some((battletag, nickname)) = extract_user_info_from_441_packet(data) {
-                log!("USER INFO (SENDTO): battletag={} nickname={}", battletag, nickname);
-                add_room_user_with_info(&battletag, &nickname, &dest_ip, dest_port);
+                log!("USER INFO (SENDTO/SELF): battletag={} nickname={}", battletag, nickname);
+                add_room_user_with_info(&battletag, &nickname, "127.0.0.1", 0);
             }
 
             if is_kick_packet(data) {
@@ -2608,6 +2945,11 @@ unsafe extern "system" fn hooked_wsarecvfrom(
                     // Record recv time for latency calculation
                     record_recv_time(addr.sin_addr, src_port);
 
+                    // Register peer player_id from relay connection info packets
+                    if let Some(peer_id) = extract_peer_player_id_from_relay(data) {
+                        register_peer_player_id(&peer_id);
+                    }
+
                     // Check for disconnect packet (peer leaving)
                     if is_disconnect_packet(data) {
                         log!("=== DISCONNECT PACKET from {}:{} ===", src_ip, src_port);
@@ -2656,6 +2998,7 @@ unsafe extern "system" fn hooked_wsarecvfrom(
                             room_name, map_name, host_name, format_hex(&room_id));
                         clear_room_users();
                         clear_latency_peers();
+                        activate_map_scan_block();
                         update_room_info(&room_name, &map_name, &host_name, &room_id);
                     }
 
@@ -2670,6 +3013,9 @@ unsafe extern "system" fn hooked_wsarecvfrom(
                         log!("USER INFO DETECTED: battletag={} nickname={} from {}:{}",
                             battletag, nickname, src_ip, src_port);
                         add_room_user_with_info(&battletag, &nickname, &src_ip, src_port);
+
+                        // Try to match this battletag to a peer player_id (for P2P IP resolution)
+                        match_peer_to_battletag(&battletag);
 
                         // Failsafe: re-check blacklist cache for this user
                         let matched_target = {
