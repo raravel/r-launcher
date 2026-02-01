@@ -57,6 +57,14 @@ type WSARecvFromFn = unsafe extern "system" fn(
     SOCKET, *const WsaBuf, u32, *mut u32, *mut u32, *mut SockAddrIn, *mut i32, *mut c_void, *mut c_void
 ) -> i32;
 
+// File system function types (map scan skip)
+type CreateFileWFn = unsafe extern "system" fn(
+    *const u16, u32, u32, *mut c_void, u32, u32, *mut c_void
+) -> *mut c_void;
+type CreateFileAFn = unsafe extern "system" fn(
+    *const u8, u32, u32, *mut c_void, u32, u32, *mut c_void
+) -> *mut c_void;
+
 // ============================================================================
 // Original Function Pointers
 // ============================================================================
@@ -69,6 +77,8 @@ static ORIGINAL_CONNECT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut()
 static ORIGINAL_CLOSESOCKET: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static ORIGINAL_WSASENDTO: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static ORIGINAL_WSARECVFROM: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static ORIGINAL_CREATE_FILE_W: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static ORIGINAL_CREATE_FILE_A: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 // ============================================================================
 // Global State
@@ -2135,6 +2145,157 @@ unsafe fn sanitize_game_nickname_packet(buf: *mut u8, len: usize) -> bool {
     false
 }
 
+// ============================================================================
+// Map Scan Skip - CreateFile hooks (block Maps directory open)
+// ============================================================================
+
+/// Convert a wide (UTF-16) null-terminated string pointer to a lowercase Rust String.
+unsafe fn wstr_to_lowercase(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    let slice = std::slice::from_raw_parts(ptr, len);
+    String::from_utf16_lossy(slice).to_lowercase()
+}
+
+/// Convert an ANSI (null-terminated u8) string pointer to a lowercase Rust String.
+unsafe fn astr_to_lowercase(ptr: *const u8) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    let slice = std::slice::from_raw_parts(ptr, len);
+    String::from_utf8_lossy(slice).to_lowercase()
+}
+
+/// Check if the path is inside the StarCraft Maps directory (directory itself OR files within).
+/// Blocks both directory opens and individual file reads to prevent the entire scan chain.
+/// The directory listing (NtQueryDirectoryFile) bypasses our hook, so StarCraft still gets
+/// the file list — but every subsequent CreateFileW for individual .scx/.scm files will fail
+/// instantly, making the scan complete in milliseconds instead of seconds.
+fn is_maps_scan_path(path: &str) -> bool {
+    // Match: ...\starcraft\maps\download\anything  or  ...\starcraft\maps\anything.scx/.scm
+    // But NOT: ...\starcraft\maps  (just the directory path with no child — let that through)
+    if let Some(pos) = path.find("starcraft\\maps").or_else(|| path.find("starcraft/maps")) {
+        let after = &path[pos + "starcraft/maps".len()..];
+        // Has content after "starcraft\maps" → it's a file or subdirectory access
+        return !after.is_empty() && after != "\\" && after != "/";
+    }
+    false
+}
+
+extern "system" {
+    fn SetLastError(dwErrCode: u32);
+}
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const GENERIC_WRITE: u32 = 0x40000000;
+
+/// Stores the lowercase filename of the current game map (whitelisted for read/write).
+/// Set when StarCraft writes (saves) a downloaded map file.
+static ALLOWED_MAP_FILE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+
+/// Extract just the filename from a full path (lowercase).
+fn extract_filename(path: &str) -> &str {
+    path.rsplit(|c: char| c == '\\' || c == '/').next().unwrap_or("")
+}
+
+unsafe extern "system" fn hooked_create_file_w(
+    lp_file_name: *const u16,
+    dw_desired_access: u32,
+    dw_share_mode: u32,
+    lp_security_attributes: *mut c_void,
+    dw_creation_disposition: u32,
+    dw_flags_and_attributes: u32,
+    h_template_file: *mut c_void,
+) -> *mut c_void {
+    let path = wstr_to_lowercase(lp_file_name);
+
+    if is_maps_scan_path(&path) {
+        let filename = extract_filename(&path);
+
+        let should_block = if dw_desired_access & GENERIC_WRITE != 0 {
+            // WRITE access = saving downloaded map from CDN → allow + whitelist
+            log!("MAP WRITE ALLOWED (whitelisted): {}", filename);
+            *ALLOWED_MAP_FILE.lock() = Some(filename.to_string());
+            false
+        } else {
+            // READ access: allow only if this file was whitelisted
+            let is_whitelisted = ALLOWED_MAP_FILE.lock().as_deref() == Some(filename);
+            if is_whitelisted {
+                log!("MAP READ ALLOWED (whitelisted): {}", filename);
+            }
+            !is_whitelisted
+        };
+
+        if should_block {
+            log!("SKIP MAP SCAN (CreateFileW): {}", path);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return -1isize as *mut c_void; // INVALID_HANDLE_VALUE
+        }
+    }
+
+    let original: CreateFileWFn =
+        std::mem::transmute(ORIGINAL_CREATE_FILE_W.load(Ordering::SeqCst));
+    original(
+        lp_file_name, dw_desired_access, dw_share_mode,
+        lp_security_attributes, dw_creation_disposition,
+        dw_flags_and_attributes, h_template_file,
+    )
+}
+
+unsafe extern "system" fn hooked_create_file_a(
+    lp_file_name: *const u8,
+    dw_desired_access: u32,
+    dw_share_mode: u32,
+    lp_security_attributes: *mut c_void,
+    dw_creation_disposition: u32,
+    dw_flags_and_attributes: u32,
+    h_template_file: *mut c_void,
+) -> *mut c_void {
+    let path = astr_to_lowercase(lp_file_name);
+
+    if is_maps_scan_path(&path) {
+        let filename = extract_filename(&path);
+
+        let should_block = if dw_desired_access & GENERIC_WRITE != 0 {
+            log!("MAP WRITE ALLOWED (whitelisted): {}", filename);
+            *ALLOWED_MAP_FILE.lock() = Some(filename.to_string());
+            false
+        } else {
+            let is_whitelisted = ALLOWED_MAP_FILE.lock().as_deref() == Some(filename);
+            if is_whitelisted {
+                log!("MAP READ ALLOWED (whitelisted): {}", filename);
+            }
+            !is_whitelisted
+        };
+
+        if should_block {
+            log!("SKIP MAP SCAN (CreateFileA): {}", path);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return -1isize as *mut c_void; // INVALID_HANDLE_VALUE
+        }
+    }
+
+    let original: CreateFileAFn =
+        std::mem::transmute(ORIGINAL_CREATE_FILE_A.load(Ordering::SeqCst));
+    original(
+        lp_file_name, dw_desired_access, dw_share_mode,
+        lp_security_attributes, dw_creation_disposition,
+        dw_flags_and_attributes, h_template_file,
+    )
+}
+
+// ============================================================================
+// Winsock Hook Functions
+// ============================================================================
+
 unsafe extern "system" fn hooked_recv(socket: SOCKET, buf: *mut u8, len: i32, flags: i32) -> i32 {
     let original: RecvFn = std::mem::transmute(ORIGINAL_RECV.load(Ordering::SeqCst));
     let result = original(socket, buf, len, flags);
@@ -2590,8 +2751,44 @@ fn install_hooks() -> bool {
             }
         }
 
+        // ====================================================================
+        // kernel32.dll hooks - Map scan skip
+        // ====================================================================
+        let kernel32 = match GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr())) {
+            Ok(h) => h,
+            Err(_) => {
+                log!("Failed to get kernel32.dll handle (map scan skip disabled)");
+                HOOKS_INSTALLED.store(true, Ordering::SeqCst);
+                return true;
+            }
+        };
+
+        // Install CreateFileW hook
+        if let Some(target) = GetProcAddress(kernel32, PCSTR(b"CreateFileW\0".as_ptr())) {
+            match MinHook::create_hook(target as *mut c_void, hooked_create_file_w as *mut c_void) {
+                Ok(original) => {
+                    ORIGINAL_CREATE_FILE_W.store(original, Ordering::SeqCst);
+                    let _ = MinHook::enable_hook(target as *mut c_void);
+                    log!("CreateFileW hook installed at {:p}", target);
+                }
+                Err(e) => log!("Failed to create CreateFileW hook: {:?}", e),
+            }
+        }
+
+        // Install CreateFileA hook
+        if let Some(target) = GetProcAddress(kernel32, PCSTR(b"CreateFileA\0".as_ptr())) {
+            match MinHook::create_hook(target as *mut c_void, hooked_create_file_a as *mut c_void) {
+                Ok(original) => {
+                    ORIGINAL_CREATE_FILE_A.store(original, Ordering::SeqCst);
+                    let _ = MinHook::enable_hook(target as *mut c_void);
+                    log!("CreateFileA hook installed at {:p}", target);
+                }
+                Err(e) => log!("Failed to create CreateFileA hook: {:?}", e),
+            }
+        }
+
         HOOKS_INSTALLED.store(true, Ordering::SeqCst);
-        log!("All hooks installed successfully");
+        log!("All hooks installed successfully (including map scan skip)");
         true
     }
 }
