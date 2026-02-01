@@ -2235,7 +2235,6 @@ unsafe extern "system" fn hooked_create_file_w(
         };
 
         if should_block {
-            log!("SKIP MAP SCAN (CreateFileW): {}", path);
             SetLastError(ERROR_FILE_NOT_FOUND);
             return -1isize as *mut c_void; // INVALID_HANDLE_VALUE
         }
@@ -2277,7 +2276,6 @@ unsafe extern "system" fn hooked_create_file_a(
         };
 
         if should_block {
-            log!("SKIP MAP SCAN (CreateFileA): {}", path);
             SetLastError(ERROR_FILE_NOT_FOUND);
             return -1isize as *mut c_void; // INVALID_HANDLE_VALUE
         }
@@ -2296,6 +2294,62 @@ unsafe extern "system" fn hooked_create_file_a(
 // Winsock Hook Functions
 // ============================================================================
 
+/// Try to extract readable text from a WebSocket frame (server-side: unmasked).
+/// Returns Some(text) if the data looks like a WS text frame with JSON.
+fn try_extract_ws_text(data: &[u8]) -> Option<String> {
+    if data.len() < 2 {
+        return None;
+    }
+    let opcode = data[0] & 0x0F;
+    if opcode != 1 {
+        return None;
+    }
+    let masked = (data[1] & 0x80) != 0;
+    let mut payload_len = (data[1] & 0x7F) as usize;
+    let mut offset = 2usize;
+
+    if payload_len == 126 {
+        if data.len() < 4 { return None; }
+        payload_len = ((data[2] as usize) << 8) | (data[3] as usize);
+        offset = 4;
+    } else if payload_len == 127 {
+        if data.len() < 10 { return None; }
+        payload_len = 0;
+        for i in 0..8 {
+            payload_len = (payload_len << 8) | (data[2 + i] as usize);
+        }
+        offset = 10;
+    }
+
+    let mask_key = if masked {
+        if data.len() < offset + 4 { return None; }
+        let key = [data[offset], data[offset+1], data[offset+2], data[offset+3]];
+        offset += 4;
+        Some(key)
+    } else {
+        None
+    };
+
+    if data.len() < offset + payload_len || payload_len == 0 {
+        return None;
+    }
+
+    let mut payload = data[offset..offset + payload_len].to_vec();
+    if let Some(key) = mask_key {
+        for i in 0..payload.len() {
+            payload[i] ^= key[i % 4];
+        }
+    }
+
+    match String::from_utf8(payload) {
+        Ok(s) if s.contains('{') || s.contains("endpoint") => {
+            let truncated = if s.len() > 500 { format!("{}...", &s[..500]) } else { s };
+            Some(truncated)
+        }
+        _ => None,
+    }
+}
+
 unsafe extern "system" fn hooked_recv(socket: SOCKET, buf: *mut u8, len: i32, flags: i32) -> i32 {
     let original: RecvFn = std::mem::transmute(ORIGINAL_RECV.load(Ordering::SeqCst));
     let result = original(socket, buf, len, flags);
@@ -2313,6 +2367,11 @@ unsafe extern "system" fn hooked_recv(socket: SOCKET, buf: *mut u8, len: i32, fl
         if let Some(nickname) = extract_nickname_from_pnm(data) {
             log!("NICKNAME in PNM packet: {}", nickname);
         }
+
+        // Decode WebSocket text frames
+        if let Some(ws_text) = try_extract_ws_text(data) {
+            log!("[WS RECV] socket={} text={}", socket, ws_text);
+        }
     }
 
     result
@@ -2323,6 +2382,11 @@ unsafe extern "system" fn hooked_send(socket: SOCKET, buf: *const u8, len: i32, 
         let data = std::slice::from_raw_parts(buf, len as usize);
         log!("[SEND] socket={} len={} data={}",
             socket, len, format_hex(data));
+
+        // Decode WebSocket text frames
+        if let Some(ws_text) = try_extract_ws_text(data) {
+            log!("[WS SEND] socket={} text={}", socket, ws_text);
+        }
     }
 
     let original: SendFn = std::mem::transmute(ORIGINAL_SEND.load(Ordering::SeqCst));
